@@ -460,9 +460,11 @@ class Runner:
         self.novelloaders_iter = []
         
         # Diffusion fixer
-        self.difix = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
-        self.difix.set_progress_bar_config(disable=True)
-        self.difix.to("cuda")
+        self.difix = None
+        if cfg.fix_steps:
+            self.difix = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
+            self.difix.set_progress_bar_config(disable=True)
+            self.difix.to("cuda")
 
     def rasterize_splats(
         self,

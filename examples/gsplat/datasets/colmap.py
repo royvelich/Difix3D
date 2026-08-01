@@ -168,13 +168,18 @@ class Parser:
             colmap_to_image = dict(zip(colmap_files, image_files))
             image_names = colmap_files
             image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
-        elif "DL3DV-Benchmark" in data_dir:
+        elif "DL3DV-Benchmark" in data_dir or "difix_pairs" in data_dir:
             colmap_files = sorted(_get_rel_paths(colmap_image_dir))
             image_files = sorted(_get_rel_paths(image_dir))
             colmap_to_image = dict(zip(colmap_files, image_files))
-            if len(colmap_files) != len(image_names):
-                print(f"Warning: colmap_files: {len(colmap_files)}, image_names: {len(image_names)}")
-                image_names = colmap_files
+            # Filter out COLMAP images missing from disk (known DL3DV data quality issue)
+            valid_mask = [f in colmap_to_image for f in image_names]
+            if not all(valid_mask):
+                n_missing = sum(1 for v in valid_mask if not v)
+                print(f"Warning: {n_missing} COLMAP images missing from disk, skipping them.")
+                camtoworlds = camtoworlds[[i for i, v in enumerate(valid_mask) if v]]
+                camera_ids = [c for c, v in zip(camera_ids, valid_mask) if v]
+                image_names = [f for f, v in zip(image_names, valid_mask) if v]
             image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
         else:
             colmap_files = sorted(_get_rel_paths(colmap_image_dir))
