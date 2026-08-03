@@ -161,31 +161,34 @@ class Parser:
                 raise ValueError(f"Image folder {d} does not exist.")
 
         # Downsampled images may have different names vs images used for COLMAP,
-        # so we need to map between the two sorted lists of files.
+        # so we need to map between the two sorted lists of files. The only
+        # per-dataset difference is the sort key: the nerfstudio naming scheme
+        # sorts by the numeric frame suffix, everything else lexically (safe for
+        # DL3DV's zero-padded frame_NNNNN.png).
         if "3dv-dataset-nerfstudio" in data_dir:
-            colmap_files = sorted(_get_rel_paths(colmap_image_dir), key=lambda x: int(x.split(".")[0].split("_")[-1]))
-            image_files = sorted(_get_rel_paths(image_dir), key=lambda x: int(x.split(".")[0].split("_")[-1]))
-            colmap_to_image = dict(zip(colmap_files, image_files))
+            _key = lambda x: int(x.split(".")[0].split("_")[-1])
+            colmap_files = sorted(_get_rel_paths(colmap_image_dir), key=_key)
+            image_files = sorted(_get_rel_paths(image_dir), key=_key)
             image_names = colmap_files
-            image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
-        elif "DL3DV-Benchmark" in data_dir or "difix_pairs" in data_dir:
-            colmap_files = sorted(_get_rel_paths(colmap_image_dir))
-            image_files = sorted(_get_rel_paths(image_dir))
-            colmap_to_image = dict(zip(colmap_files, image_files))
-            # Filter out COLMAP images missing from disk (known DL3DV data quality issue)
-            valid_mask = [f in colmap_to_image for f in image_names]
-            if not all(valid_mask):
-                n_missing = sum(1 for v in valid_mask if not v)
-                print(f"Warning: {n_missing} COLMAP images missing from disk, skipping them.")
-                camtoworlds = camtoworlds[[i for i, v in enumerate(valid_mask) if v]]
-                camera_ids = [c for c, v in zip(camera_ids, valid_mask) if v]
-                image_names = [f for f, v in zip(image_names, valid_mask) if v]
-            image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
         else:
             colmap_files = sorted(_get_rel_paths(colmap_image_dir))
             image_files = sorted(_get_rel_paths(image_dir))
-            colmap_to_image = dict(zip(colmap_files, image_files))
-            image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        colmap_to_image = dict(zip(colmap_files, image_files))
+
+        # Drop COLMAP images with no file on disk. This is UNCONDITIONAL by
+        # design: it is a no-op when every image is present, and gating it on a
+        # substring of data_dir (the previous behaviour) meant renaming the
+        # output directory silently disabled it -- which crashed on the one
+        # DL3DV scene with missing frames. camtoworlds/camera_ids/image_names
+        # are filtered together so poses stay aligned with names.
+        valid_mask = [f in colmap_to_image for f in image_names]
+        if not all(valid_mask):
+            n_missing = sum(1 for v in valid_mask if not v)
+            print(f"Warning: {n_missing} COLMAP images missing from disk, skipping them.")
+            camtoworlds = camtoworlds[[i for i, v in enumerate(valid_mask) if v]]
+            camera_ids = [c for c, v in zip(camera_ids, valid_mask) if v]
+            image_names = [f for f, v in zip(image_names, valid_mask) if v]
+        image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
