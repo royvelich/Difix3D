@@ -221,6 +221,30 @@ class Parser:
             transform = np.eye(4)
 
         self.image_names = image_names  # List[str], (num_images,)
+
+        # OPTIONAL EXPLICIT SPLIT (pairgen): {"train": [...], "val": [...]} of indices
+        # into THIS image_names ordering. Read from the data_dir so it needs no plumbing
+        # through the trainer CLI, and lives in a task-scoped dir so concurrent tasks of
+        # the same scene cannot see each other's. When absent, test_every behaves exactly
+        # as before -- every existing run is unaffected.
+        self.split_indices = None
+        _si = os.path.join(data_dir, "split_indices.json")
+        if os.path.exists(_si):
+            import json as _json
+            with open(_si) as _f:
+                _d = _json.load(_f)
+            n = len(image_names)
+            for _k in ("train", "val"):
+                bad = [i for i in _d[_k] if not (0 <= i < n)]
+                if bad:
+                    raise ValueError(
+                        f"split_indices.json '{_k}' has {len(bad)} index/indices outside "
+                        f"[0,{n}) after the parser filtered missing images, e.g. {bad[:5]}. "
+                        f"The split was computed against a different frame list."
+                    )
+            self.split_indices = {"train": list(_d["train"]), "val": list(_d["val"])}
+            print(f"[colmap] explicit split: {len(self.split_indices['train'])} train / "
+                  f"{len(self.split_indices['val'])} val (test_every ignored)")
         self.image_paths = image_paths  # List[str], (num_images,)
         self.alpha_mask_paths = None  # List[str], (num_images,)
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
@@ -264,12 +288,36 @@ class Parser:
             width, height = self.imsize_dict[camera_id]
 
             if camtype == "perspective":
+                # OpenCV pixel-coordinate convention: OpenCV puts the CENTRE of the
+                # top-left pixel at (0,0), while COLMAP/nerfstudio put it at
+                # (0.5,0.5). K arrives in the COLMAP convention, so shift the
+                # principal point by -0.5 for the OpenCV calls and restore it
+                # afterwards -- nerfstudio issue #3048, and what nerfstudio's own
+                # _undistort_image and FlowR's util/undistort.py both do. Upstream
+                # gsplat omits it (the fisheye branch below omits it too).
+                # MEASURED on DL3DV (k1=-0.0017): this moves cx by 0.003 px, i.e.
+                # far below anything observable. Applied for correctness, not effect.
+                K_cv = K.copy()
+                K_cv[0, 2] -= 0.5
+                K_cv[1, 2] -= 0.5
                 K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
-                    K, params, (width, height), 0
+                    K_cv, params, (width, height), 0
                 )
                 mapx, mapy = cv2.initUndistortRectifyMap(
-                    K, params, None, K_undist, (width, height), cv2.CV_32FC1
+                    K_cv, params, None, K_undist, (width, height), cv2.CV_32FC1
                 )
+                K_undist = K_undist.copy()
+                K_undist[0, 2] += 0.5
+                K_undist[1, 2] += 0.5
+                # The image is cropped to roi_undist below (see the Dataset item
+                # getter), so the principal point must move with the crop origin.
+                # The fisheye branch already does this; perspective did NOT, which
+                # is a real error for any camera whose ROI origin is non-zero.
+                # MEASURED on DL3DV: roi is (0, 0, 1919, 1079), so x=y=0 and this
+                # is a no-op there -- kept because silently depending on x==0 is
+                # exactly the kind of assumption that breaks on the next dataset.
+                K_undist[0, 2] -= roi_undist[0]
+                K_undist[1, 2] -= roi_undist[1]
                 mask = None
             elif camtype == "fisheye":
                 fx = K[0, 0]
@@ -340,7 +388,13 @@ class Dataset:
         self.load_depths = load_depths
         
         indices = np.arange(len(self.parser.image_names))
-        if self.parser.test_every == 1:
+        if getattr(self.parser, "split_indices", None) is not None:
+            # Explicit list wins over test_every entirely. Needed for splits that no
+            # stride can express -- e.g. DiFix's two contiguous pose clusters, where
+            # block A is 0..103 + 262..318.
+            self.indices = np.array(self.parser.split_indices[
+                "train" if split == "train" else "val"], dtype=int)
+        elif self.parser.test_every == 1:
             image_names = sorted(_get_rel_paths(f"{self.parser.data_dir}/images"), key=lambda x: int(x.split(".")[0].split("_")[-1]))
             assert len(image_names) == len(self.parser.image_names)
             if split == "train":
