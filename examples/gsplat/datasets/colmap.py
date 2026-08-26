@@ -229,7 +229,13 @@ class Parser:
         # as before -- every existing run is unaffected.
         self.split_indices = None
         _si = os.path.join(data_dir, "split_indices.json")
-        if os.path.exists(_si):
+        # test_every == 0 means "every view, both splits" and is how callers ask for a
+        # split-INDEPENDENT view of the scene (pairgen's undistorted cache does exactly
+        # that, with a second parser). An explicit split file must NOT override that, or
+        # the cache silently covers only one block.
+        if test_every == 0:
+            _si = None
+        if _si and os.path.exists(_si):
             import json as _json
             with open(_si) as _f:
                 _d = _json.load(_f)
