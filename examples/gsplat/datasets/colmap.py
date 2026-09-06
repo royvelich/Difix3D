@@ -263,6 +263,42 @@ class Parser:
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
+
+        # OPT-IN: restrict the init cloud to points the TRAINING views actually observed.
+        # Points visible only in held-out views are a geometry+colour prior a sparse
+        # reconstruction should not have (~91% of the cloud at k=4). GSFixer and GeoQuery
+        # both filter; upstream gsplat does not. Env-gated so the default is unchanged.
+        if os.environ.get("PAIRGEN_FILTER_POINTS"):
+            n_all = len(points)
+            idx = np.arange(len(image_names))
+            if getattr(self, "split_indices", None) is not None:
+                train_pos = list(self.split_indices["train"])
+            elif test_every == 0:
+                train_pos = list(idx)
+            elif test_every == 1:
+                train_pos = [i for i in idx if "_train_" in image_names[i]]
+            else:
+                train_pos = [int(i) for i in idx[idx % test_every == 0]]
+            keep = set()
+            for i in train_pos:
+                keep.update(point_indices.get(image_names[i], []).tolist())
+            keep = sorted(keep)
+            if keep:
+                remap = {old: new for new, old in enumerate(keep)}
+                points = points[keep]
+                points_err = points_err[keep]
+                points_rgb = points_rgb[keep]
+                point_indices = {
+                    k: np.array([remap[i] for i in v if i in remap], dtype=np.int32)
+                    for k, v in point_indices.items()
+                }
+                self.points = points
+                self.points_err = points_err
+                self.points_rgb = points_rgb
+                self.point_indices = point_indices
+                print(f"[colmap] PAIRGEN_FILTER_POINTS: {len(keep)} of {n_all} points kept "
+                      f"({100.0 * (1 - len(keep) / max(n_all, 1)):.1f}% dropped as "
+                      f"unobserved by the {len(train_pos)} training views)")
         self.transform = transform  # np.ndarray, (4, 4)
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
