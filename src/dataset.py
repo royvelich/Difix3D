@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from torchvision.transforms import InterpolationMode
 import torchvision.transforms.functional as F
 
 
@@ -190,13 +191,21 @@ class PairedDataset(torch.utils.data.Dataset):
         try:
             with Image.open(path) as image:
                 image = image.convert("RGB")
+                # Match PixelDiT preprocessing exactly: resize the PIL image
+                # before converting it to a tensor. Resizing the float tensor
+                # produces slightly different pixels.
+                image = F.resize(
+                    image,
+                    self.image_size,
+                    interpolation=InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
                 tensor = F.to_tensor(image)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load {field_name} for record {record_id!r}: {path}"
             ) from exc
 
-        tensor = F.resize(tensor, self.image_size, antialias=True)
         return F.normalize(tensor, mean=[0.5], std=[0.5])
 
     def __getitem__(self, idx):

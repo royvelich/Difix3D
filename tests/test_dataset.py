@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import torch
 from PIL import Image
+from torchvision.transforms import InterpolationMode
+import torchvision.transforms.functional as F
 
 from src.dataset import PairedDataset
 
@@ -124,6 +126,77 @@ class PairedDatasetTest(unittest.TestCase):
             self.assertEqual(len(dataset), 2)
             self.assertEqual(dataset[1]["record_id"], "pair-1")
             self.assertEqual(dataset[1]["caption"], "prompt-1")
+
+    def test_resizes_pil_image_before_tensor_conversion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "pattern.png"
+            image = Image.new("RGB", (3, 2))
+            image.putdata(
+                [
+                    (0, 10, 250),
+                    (255, 30, 0),
+                    (20, 240, 40),
+                    (245, 0, 120),
+                    (15, 220, 255),
+                    (230, 80, 10),
+                ]
+            )
+            image.save(image_path)
+
+            manifest_path = root / "data.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "train": [
+                            {
+                                "id": "pair-0",
+                                "image": "pattern.png",
+                                "target_image": "pattern.png",
+                                "ref_image": "pattern.png",
+                            }
+                        ]
+                    }
+                )
+            )
+            dataset = PairedDataset(
+                manifest_path,
+                "train",
+                height=5,
+                width=7,
+            )
+
+            actual = dataset[0]["conditioning_pixel_values"][0]
+            with Image.open(image_path) as source:
+                source = source.convert("RGB")
+                pil_resized = F.resize(
+                    source,
+                    (5, 7),
+                    interpolation=InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+                expected = F.normalize(
+                    F.to_tensor(pil_resized),
+                    mean=[0.5],
+                    std=[0.5],
+                )
+
+                tensor_first = F.normalize(
+                    F.resize(
+                        F.to_tensor(source),
+                        (5, 7),
+                        interpolation=InterpolationMode.BILINEAR,
+                        antialias=True,
+                    ),
+                    mean=[0.5],
+                    std=[0.5],
+                )
+
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            self.assertGreater(
+                torch.max(torch.abs(actual - tensor_first)).item(),
+                1e-4,
+            )
 
 
 if __name__ == "__main__":
