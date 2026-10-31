@@ -138,6 +138,7 @@ accelerate launch --mixed_precision=bf16 --main_process_port 29501 --multi_gpu -
     --output_dir=./outputs/difix/train \
     --dataset_path="data/difix_train.jsonl" \
     --validation_dataset_path="data/validation_data.json" \
+    --validation_data_root="data/validation_images" \
     --max_train_steps 10000 \
     --height=576 --width=1024 --learning_rate 2e-5 \
     --train_batch_size=1 --dataloader_num_workers 8 \
@@ -149,9 +150,11 @@ accelerate launch --mixed_precision=bf16 --main_process_port 29501 --multi_gpu -
 ```
 
 Use `--validation_dataset_path` when training and validation are stored in
-different manifests. Relative image paths are resolved against the manifest
-directory (or `--data_root`). Machine-specific absolute path prefixes can be
-remapped with `--path_prefix_from OLD --path_prefix_to NEW`.
+different manifests. Relative training paths are resolved against the training
+manifest directory (or `--data_root`), while relative validation paths use the
+validation manifest directory (or `--validation_data_root`, falling back to
+`--data_root`). Machine-specific absolute path prefixes can be remapped with
+`--path_prefix_from OLD --path_prefix_to NEW`.
 
 ### Inference
 

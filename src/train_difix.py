@@ -62,14 +62,14 @@ def _image_panel(conditioning, target, prediction, index):
     )
 
 
-def _dataset_kwargs(args):
+def _dataset_kwargs(args, data_root=None):
     return {
         "height": args.height,
         "width": args.width,
         "prompt_override": args.prompt,
         "default_prompt": args.default_prompt,
         "require_reference": True,
-        "data_root": args.data_root,
+        "data_root": args.data_root if data_root is None else data_root,
         "path_prefix_from": args.path_prefix_from,
         "path_prefix_to": args.path_prefix_to,
     }
@@ -81,7 +81,10 @@ def _build_validation_loader(args, tokenizer):
         dataset_path=validation_path,
         split=args.validation_split,
         tokenizer=tokenizer,
-        **_dataset_kwargs(args),
+        **_dataset_kwargs(
+            args,
+            data_root=args.validation_data_root or args.data_root,
+        ),
     )
     if len(dataset) == 0:
         raise ValueError(
@@ -554,6 +557,7 @@ def parse_args():
     parser.add_argument("--train_split", default="train")
     parser.add_argument("--validation_split", default="test")
     parser.add_argument("--data_root", default=None)
+    parser.add_argument("--validation_data_root", default=None)
     parser.add_argument("--path_prefix_from", default=None)
     parser.add_argument("--path_prefix_to", default=None)
     parser.add_argument("--prompt", default=None)
