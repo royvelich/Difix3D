@@ -1,0 +1,23 @@
+{
+  "metadata": {
+    "ignored": true
+  },
+  "train": {
+    "pair-0": {
+      "image": "corrupt-0.png",
+      "target_image": "clean-0.png",
+      "ref_image": "ref-0.png",
+      "prompt": "remove degradation",
+      "large_unused_field": [1, 2, 3]
+    },
+    "pair-1": {
+      "image": "corrupt-1.png",
+      "target_image": "clean-1.png",
+      "ref_image": "ref-1.png",
+      "other_unused_field": {
+        "value": true
+      }
+    }
+  },
+  "test": {}
+}

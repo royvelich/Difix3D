@@ -2,6 +2,7 @@ import os
 import imageio
 import argparse
 import numpy as np
+import torch
 from PIL import Image
 from glob import glob
 from tqdm import tqdm
@@ -18,6 +19,7 @@ if __name__ == "__main__":
     parser.add_argument('--prompt', type=str, required=True, help='The prompt to be used')
     parser.add_argument('--model_name', type=str, default=None, help='Name of the pretrained model to be used')
     parser.add_argument('--model_path', type=str, default=None, help='Path to a model state dict to be used')
+    parser.add_argument('--base_model_name_or_path', type=str, default='stabilityai/sd-turbo', help='SD-Turbo base model path or Hugging Face name')
     parser.add_argument('--output_dir', type=str, default='output', help='Directory to save the output')
     parser.add_argument('--seed', type=int, default=42, help='Random seed to be used')
     parser.add_argument('--timestep', type=int, default=199, help='Diffusion timestep')
@@ -33,7 +35,10 @@ if __name__ == "__main__":
         pretrained_path=args.model_path,
         timestep=args.timestep,
         mv_unet=True if args.ref_image is not None else False,
+        base_model_name_or_path=args.base_model_name_or_path,
     )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
     model.set_eval()
 
     # Load input images

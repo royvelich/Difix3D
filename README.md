@@ -85,15 +85,44 @@ Prepare your dataset in the following JSON format:
 }
 ```
 
+The loader accepts either dictionaries or lists for `train` and `test`, and
+ignores additional metadata fields. For the vanilla reference-conditioned
+experiment it always uses `ref_image` (our rank-0 reference):
+
+| Stream | Model input | Supervision target |
+| --- | --- | --- |
+| Render | corrupt render (`image`) | clean render (`target_image`) |
+| Reference | rank-0 reference (`ref_image`) | the same rank-0 reference |
+
+This is the original two-view Difix objective. It does not use depth, warps,
+wrapped references, validity masks, or custom attention.
+
+Our full training `data.json` is too large to load once per distributed
+process. Convert its `train` split to compact indexed JSONL once:
+
+```bash
+python scripts/build_difix_manifest.py \
+    --input /path/to/training-corpus/data.json \
+    --output /path/to/training-corpus/difix_train.jsonl \
+    --split train
+```
+
+This keeps only `image`, `target_image`, `ref_image`, and `prompt`, and creates
+`difix_train.jsonl.idx` for random access. The index is memory-mapped, so all
+training and DataLoader processes can share it without each parsing the full
+JSON manifest. Pass `difix_train.jsonl` as `--dataset_path`; regular JSON
+manifests remain supported for smaller validation sets.
+
 #### Single GPU
 
 ```bash
 accelerate launch --mixed_precision=bf16 src/train_difix.py \
     --output_dir=./outputs/difix/train \
-    --dataset_path="data/data.json" \
+    --dataset_path="data/difix_train.jsonl" \
     --max_train_steps 10000 \
-    --resolution=512 --learning_rate 2e-5 \
+    --height=576 --width=1024 --learning_rate 2e-5 \
     --train_batch_size=1 --dataloader_num_workers 8 \
+    --mv_unet \
     --enable_xformers_memory_efficient_attention \
     --checkpointing_steps=1000 --eval_freq 1000 --viz_freq 100 \
     --lambda_lpips 1.0 --lambda_l2 1.0 --lambda_gram 1.0 --gram_loss_warmup_steps 2000 \
@@ -107,15 +136,22 @@ export NUM_NODES=1
 export NUM_GPUS=8
 accelerate launch --mixed_precision=bf16 --main_process_port 29501 --multi_gpu --num_machines $NUM_NODES --num_processes $NUM_GPUS src/train_difix.py \
     --output_dir=./outputs/difix/train \
-    --dataset_path="data/data.json" \
+    --dataset_path="data/difix_train.jsonl" \
+    --validation_dataset_path="data/validation_data.json" \
     --max_train_steps 10000 \
-    --resolution=512 --learning_rate 2e-5 \
+    --height=576 --width=1024 --learning_rate 2e-5 \
     --train_batch_size=1 --dataloader_num_workers 8 \
+    --mv_unet \
     --enable_xformers_memory_efficient_attention \
     --checkpointing_steps=1000 --eval_freq 1000 --viz_freq 100 \
     --lambda_lpips 1.0 --lambda_l2 1.0 --lambda_gram 1.0 --gram_loss_warmup_steps 2000 \
     --report_to "wandb" --tracker_project_name "difix" --tracker_run_name "train" --timestep 199
 ```
+
+Use `--validation_dataset_path` when training and validation are stored in
+different manifests. Relative image paths are resolved against the manifest
+directory (or `--data_root`). Machine-specific absolute path prefixes can be
+remapped with `--path_prefix_from OLD --path_prefix_to NEW`.
 
 ### Inference
 
