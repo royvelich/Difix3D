@@ -76,7 +76,7 @@ exec "$python" -m accelerate.commands.launch \
   --lambda_gram=1.0 \
   --gram_loss_warmup_steps=2000 \
   --report_to=clearml \
-  --tracker_project_name=PAVE/difix \
+  --tracker_project_name=PAVE/pixel-dit \
   --tracker_run_name="$run_name" \
   --timestep=199 \
   --seed=42 \
