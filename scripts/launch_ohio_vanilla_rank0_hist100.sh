@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo=/mnt/rvelich-ebs-2/repos/Difix3D-vanilla-our-data
-accelerate=/data/rvelich/venvs/geoquery-strict-uv/bin/accelerate
+python=/data/rvelich/venvs/geoquery-strict-uv/bin/python
 train_manifest=/mnt/rvelich-ebs-2/datasets/difix_manifests/train4700_rank0.jsonl
 validation_manifest=/mnt/rvelich-ebs-2/datasets/difix_manifests/historical_val100.jsonl
 run_name=difix_vanilla_rank0_train4700_hist100_4gpu_200k_val5k_ohio_1031a
@@ -38,7 +38,7 @@ export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=4
 
 cd "$repo"
-exec "$accelerate" launch \
+exec "$python" -m accelerate.commands.launch \
   --mixed_precision=bf16 \
   --multi_gpu \
   --num_machines=1 \
