@@ -32,7 +32,48 @@ def parse_args():
         help="Optional record limit for smoke tests; 0 converts the full split.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--backend",
+        choices=("streaming", "orjson"),
+        default="streaming",
+        help=(
+            "Use the low-memory ijson stream or load the entire manifest with "
+            "orjson for faster conversion on high-memory machines."
+        ),
+    )
     return parser.parse_args()
+
+
+def iter_split_records(input_path, split, backend):
+    if backend == "streaming":
+        with input_path.open("rb") as source:
+            yield from ijson.kvitems(source, split)
+        return
+
+    try:
+        import orjson
+    except ImportError as exc:
+        raise RuntimeError(
+            "The orjson backend requires orjson to be installed."
+        ) from exc
+
+    source_bytes = input_path.read_bytes()
+    manifest = orjson.loads(source_bytes)
+    del source_bytes
+    if split not in manifest:
+        raise KeyError(f"Split {split!r} is not present in {input_path}")
+
+    split_data = manifest[split]
+    if isinstance(split_data, dict):
+        yield from split_data.items()
+    elif isinstance(split_data, list):
+        for index, record in enumerate(split_data):
+            yield str(record.get("pair_id", record.get("id", index))), record
+    else:
+        raise TypeError(
+            f"Manifest split {split!r} must be a dict or list, got "
+            f"{type(split_data).__name__}"
+        )
 
 
 def main(args):
@@ -68,11 +109,12 @@ def main(args):
 
     try:
         with (
-            input_path.open("rb") as source,
             temporary_output.open("wb") as output,
             temporary_index.open("wb") as index,
         ):
-            for record_id, record in ijson.kvitems(source, args.split):
+            for record_id, record in iter_split_records(
+                input_path, args.split, args.backend
+            ):
                 missing = [
                     field for field in REQUIRED_FIELDS if not record.get(field)
                 ]
@@ -113,6 +155,7 @@ def main(args):
             "source": str(input_path),
             "source_size_bytes": input_path.stat().st_size,
             "split": args.split,
+            "backend": args.backend,
             "records": count,
             "fields": ["record_id", *REQUIRED_FIELDS, "prompt"],
             "index_format": "little-endian uint64 byte offsets",
