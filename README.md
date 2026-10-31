@@ -156,6 +156,24 @@ validation manifest directory (or `--validation_data_root`, falling back to
 `--data_root`). Machine-specific absolute path prefixes can be remapped with
 `--path_prefix_from OLD --path_prefix_to NEW`.
 
+#### PixelDiT-compatible validation and ClearML
+
+Install the pinned validation backends without changing Difix's pinned
+Transformers version:
+
+```bash
+scripts/install_validation_deps.sh /path/to/training/venv/bin/python
+```
+
+Then pass `--report_to=clearml`. Training logs `loss`, `opt_step`,
+`grad_norm`, every component loss, and `lr` at each optimizer step.
+Validation logs exact per-pair means and medians under
+`restore-val/metrics/...` for the same PyIQA metrics as PixelDiT: PSNR, color
+SSIM, LPIPS-VGG, TOPIQ-FR, DISTS, and ST-LPIPS. `ours_ref_*` scores the
+restored render against clean GT and the mandatory `input_*` baseline scores
+the untouched corrupt render. Labeled per-pair panels are saved under
+`OUTPUT_DIR/eval/step_NNNNNNNNN/` and uploaded to ClearML.
+
 ### Inference
 
 Place the `model_*.pkl` in the `checkpoints` directory. You can run inference using the following command:

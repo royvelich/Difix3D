@@ -5,7 +5,7 @@ repo=/mnt/rvelich-ebs-2/repos/Difix3D-vanilla-our-data
 python=/data/rvelich/venvs/geoquery-strict-uv/bin/python
 train_manifest=/mnt/rvelich-ebs-2/datasets/difix_manifests/train4700_rank0.jsonl
 validation_manifest=/mnt/rvelich-ebs-2/datasets/difix_manifests/historical_val100.jsonl
-run_name=difix_vanilla_rank0_train4700_hist100_4gpu_200k_val5k_ohio_1031a
+run_name=difix_vanilla_rank0_train4700_hist100_4gpu_200k_val5k_clearml_ohio_1031b
 output_dir=/mnt/rvelich-ebs-2/training_runs/${run_name}
 
 for required_path in \
@@ -21,6 +21,8 @@ do
   fi
 done
 
+"$python" -c "import clearml, pyiqa"
+
 gpu_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sed '/^[[:space:]]*$/d')"
 if [[ -n "$gpu_pids" ]]; then
   echo "Ohio GPUs are already occupied by process IDs:" >&2
@@ -33,7 +35,6 @@ git -C "$repo" rev-parse HEAD >"$output_dir/git_commit.txt"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HF_HOME=/home/ubuntu/.cache/huggingface
-export WANDB_MODE=offline
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=4
 
@@ -69,13 +70,13 @@ exec "$python" -m accelerate.commands.launch \
   --eval_freq=5000 \
   --viz_freq=100 \
   --num_samples_eval=100 \
-  --num_validation_panel_samples=10 \
+  --num_validation_panel_samples=100 \
   --lambda_lpips=1.0 \
   --lambda_l2=1.0 \
   --lambda_gram=1.0 \
   --gram_loss_warmup_steps=2000 \
-  --report_to=wandb \
-  --tracker_project_name=difix \
+  --report_to=clearml \
+  --tracker_project_name="$run_name" \
   --tracker_run_name="$run_name" \
   --timestep=199 \
   --seed=42 \

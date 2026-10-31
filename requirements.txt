@@ -3,6 +3,7 @@ torchvision
 torchmetrics
 numpy
 accelerate
+clearml==2.1.10
 wandb
 imageio[ffmpeg]
 einops

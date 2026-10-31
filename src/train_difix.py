@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import math
 import os
 import random
@@ -13,7 +14,6 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 import torchvision
 import transformers
-import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
@@ -25,7 +25,18 @@ from torchvision.transforms.functional import crop
 
 from dataset import PairedDataset
 from loss import gram_loss
+from metrics import batch_metrics, iqa_backend_metadata
 from model import Difix, load_ckpt_from_state_dict, save_ckpt
+from visualization import build_labeled_grid, save_grid, to_uint8_panel
+
+
+PANEL_TITLES = (
+    "corrupt",
+    "reference",
+    "clean",
+    "restored render",
+    "restored reference",
+)
 
 
 def _interval_due(step, frequency):
@@ -48,18 +59,92 @@ def _find_resume_checkpoint(resume):
     raise ValueError(f"Invalid resume checkpoint or directory: {resume}")
 
 
-def _image_panel(conditioning, target, prediction, index):
-    """corrupt | reference | clean | restored render | restored reference"""
-    views = [
-        conditioning[index, 0],
-        conditioning[index, 1],
-        target[index, 0],
-        prediction[index, 0],
-        prediction[index, 1],
-    ]
-    return (torch.cat(views, dim=-1).float().detach().cpu() * 0.5 + 0.5).clamp(
-        0, 1
+def _image_panel(conditioning, target, prediction, index, caption):
+    row = {
+        "panels": [
+            to_uint8_panel(conditioning[index, 0]),
+            to_uint8_panel(conditioning[index, 1]),
+            to_uint8_panel(target[index, 0]),
+            to_uint8_panel(prediction[index, 0]),
+            to_uint8_panel(prediction[index, 1]),
+        ],
+        "caption": caption,
+    }
+    return build_labeled_grid(
+        [row],
+        PANEL_TITLES,
     )
+
+
+def _log_image(tracker, tag, image, step):
+    if tracker.name == "tensorboard":
+        tracker.writer.add_image(tag, image, step, dataformats="HWC")
+    elif tracker.name == "wandb":
+        import wandb
+
+        tracker.log({tag: wandb.Image(image)}, step=step)
+    elif tracker.name == "clearml":
+        tracker.log_images({tag: image}, step=step)
+
+
+def _log_metric_scalars(
+    tracker,
+    average_metrics,
+    median_metrics,
+    step,
+    namespace="restore-val",
+):
+    values = {
+        f"{namespace}/metrics/{name}": value
+        for name, value in average_metrics.items()
+    }
+    values.update(
+        {
+            f"{namespace}/metrics/{name}_median": value
+            for name, value in median_metrics.items()
+        }
+    )
+    if tracker.name == "tensorboard":
+        for name, value in values.items():
+            tracker.writer.add_scalar(name, value, step)
+    elif tracker.name in ("wandb", "clearml"):
+        tracker.log(values, step=step)
+
+
+def _aggregate_metric_rows(rows):
+    average_metrics = {}
+    median_metrics = {}
+    metric_counts = {}
+    metric_names = {
+        name for row in rows for name in row.get("metrics", {}).keys()
+    }
+    for name in sorted(metric_names):
+        values = [
+            float(row["metrics"][name])
+            for row in rows
+            if name in row.get("metrics", {})
+        ]
+        if values:
+            array = np.asarray(values, dtype=np.float64)
+            average_metrics[name] = float(np.mean(array))
+            median_metrics[name] = float(np.median(array))
+            metric_counts[name] = len(values)
+    return average_metrics, median_metrics, metric_counts
+
+
+def _gather_rows(accelerator, local_rows):
+    if accelerator.num_processes == 1:
+        return local_rows
+    gathered = [None] * accelerator.num_processes
+    torch.distributed.all_gather_object(gathered, local_rows)
+    return [row for process_rows in gathered for row in process_rows]
+
+
+def _gather_mean(accelerator, value):
+    if not torch.is_tensor(value):
+        value = torch.tensor(value, device=accelerator.device)
+    gathered = accelerator.gather(value.detach().float().reshape(1))
+    return float(gathered.mean().item())
 
 
 def _dataset_kwargs(args, data_root=None):
@@ -103,22 +188,26 @@ def _build_validation_loader(args, tokenizer):
 def _run_validation(
     accelerator,
     net_difix,
-    net_lpips,
     dataloader,
     weight_dtype,
     num_samples,
     num_panel_samples,
+    output_dir,
+    step,
 ):
     model = accelerator.unwrap_model(net_difix)
     model.eval()
-    l2_values = []
-    lpips_values = []
-    psnr_values = []
-    panels = []
+    local_rows = []
+    row_dir = os.path.join(output_dir, "eval", f"step_{step:09d}")
+    if accelerator.is_main_process:
+        os.makedirs(row_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     for sample_index, batch in enumerate(dataloader):
         if sample_index >= num_samples:
             break
+        if sample_index % accelerator.num_processes != accelerator.process_index:
+            continue
 
         conditioning = batch["conditioning_pixel_values"].to(
             accelerator.device, dtype=weight_dtype
@@ -130,48 +219,142 @@ def _run_validation(
 
         with torch.no_grad(), accelerator.autocast():
             prediction = model(conditioning, prompt_tokens=input_ids)
-            render_target = target[:, 0]
-            render_prediction = prediction[:, 0]
-            sample_l2 = F.mse_loss(
-                render_prediction.float(),
-                render_target.float(),
-                reduction="mean",
-            )
-            sample_lpips = net_lpips(
-                render_prediction.float(), render_target.float()
-            ).mean()
+        render_metrics = batch_metrics(prediction[:, 0], target[:, 0])
+        input_metrics = batch_metrics(conditioning[:, 0], target[:, 0])
+        reference_metrics = batch_metrics(
+            prediction[:, 1],
+            target[:, 1],
+        )
+        metrics = {
+            f"ours_ref_{name}": value
+            for name, value in render_metrics.items()
+        }
+        metrics.update(
+            {
+                f"input_{name}": value
+                for name, value in input_metrics.items()
+            }
+        )
+        metrics.update(
+            {
+                f"restored_reference_{name}": value
+                for name, value in reference_metrics.items()
+            }
+        )
 
-        l2_value = sample_l2.item()
-        l2_values.append(l2_value)
-        lpips_values.append(sample_lpips.item())
-        psnr_values.append(10.0 * math.log10(4.0 / max(l2_value, 1e-12)))
-
+        record_id = batch["record_id"][0]
+        row_path = None
         if sample_index < num_panel_samples:
-            panels.append(
-                wandb.Image(
-                    _image_panel(conditioning, target, prediction, 0),
-                    caption=(
-                        f"{batch['record_id'][0]} | corrupt, reference, clean, "
-                        "restored render, restored reference"
-                    ),
-                )
+            panel = _image_panel(
+                conditioning,
+                target,
+                prediction,
+                0,
+                str(record_id),
+            )
+            row_path = save_grid(
+                panel,
+                os.path.join(row_dir, f"pair_{sample_index:03d}.webp"),
             )
 
-    model.set_train()
-    if not l2_values:
+        local_rows.append(
+            {
+                "index": sample_index,
+                "record_id": str(record_id),
+                "row_path": row_path,
+                "metrics": metrics,
+            }
+        )
+
+    rows = sorted(
+        _gather_rows(accelerator, local_rows),
+        key=lambda row: row["index"],
+    )
+    average_metrics, median_metrics, metric_counts = _aggregate_metric_rows(
+        rows
+    )
+
+    if not rows:
         raise ValueError("Validation produced no samples")
 
-    result = {
-        "val/l2": float(np.mean(l2_values)),
-        "val/lpips": float(np.mean(lpips_values)),
-        "val/psnr": float(np.mean(psnr_values)),
-    }
-    if panels:
-        result["val/panels"] = panels
+    if accelerator.is_main_process:
+        summary_path = os.path.join(row_dir, "validation_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "namespace": "restore-val",
+                    "step": step,
+                    "num_pairs": len(rows),
+                    "columns": list(PANEL_TITLES),
+                    "iqa_backend": iqa_backend_metadata(),
+                    "average_metrics": average_metrics,
+                    "median_metrics": median_metrics,
+                    "metric_counts": metric_counts,
+                    "pairs": rows,
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+
+        trackers = accelerator.trackers if accelerator.trackers else []
+        image_tag = "restore-val/" + " | ".join(PANEL_TITLES)
+        for row in rows:
+            if row["row_path"] is None:
+                continue
+            from PIL import Image
+
+            with Image.open(row["row_path"]) as saved:
+                image = np.asarray(saved.convert("RGB"), dtype=np.uint8)
+            for tracker in trackers:
+                try:
+                    _log_image(
+                        tracker,
+                        f"{image_tag}/pair_{row['index']:02d}",
+                        image,
+                        step,
+                    )
+                except Exception as exc:
+                    print(
+                        "[restore-val] tracker image upload failed "
+                        f"({tracker.name}, pair {row['index']}): {exc}"
+                    )
+
+        for tracker in trackers:
+            try:
+                _log_metric_scalars(
+                    tracker,
+                    average_metrics,
+                    median_metrics,
+                    step,
+                )
+            except Exception as exc:
+                print(
+                    "[restore-val] tracker metric logging failed "
+                    f"({tracker.name}): {exc}"
+                )
+
+        summary_bits = []
+        for prefix in ("input", "ours_ref", "restored_reference"):
+            if f"{prefix}_psnr" not in average_metrics:
+                continue
+            summary_bits.append(
+                f"{prefix}: "
+                f"PSNR={average_metrics[f'{prefix}_psnr']:.2f} "
+                f"SSIM={average_metrics[f'{prefix}_ssim']:.3f} "
+                f"LPIPS={average_metrics[f'{prefix}_lpips']:.3f}"
+            )
+        print(
+            f"[restore-val] step {step}: "
+            + "  ".join(summary_bits)
+            + f"  panels={row_dir}"
+        )
+
+    accelerator.wait_for_everyone()
+    model.set_train()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return result
 
 
 def main(args):
@@ -320,15 +503,16 @@ def main(args):
     )
 
     if accelerator.is_main_process and args.report_to != "none":
+        init_kwargs = {}
+        if args.report_to in ("wandb", "all"):
+            init_kwargs["wandb"] = {
+                "name": args.tracker_run_name,
+                "dir": args.output_dir,
+            }
         accelerator.init_trackers(
             args.tracker_project_name,
             config=dict(vars(args)),
-            init_kwargs={
-                "wandb": {
-                    "name": args.tracker_run_name,
-                    "dir": args.output_dir,
-                }
-            },
+            init_kwargs=init_kwargs,
         )
 
     if accelerator.is_main_process:
@@ -359,6 +543,7 @@ def main(args):
 
     for epoch in range(epochs_required):
         for batch in dataloader_train:
+            grad_norm = None
             with accelerator.accumulate(net_difix):
                 conditioning = batch["conditioning_pixel_values"]
                 target = batch["output_pixel_values"]
@@ -435,7 +620,7 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
+                    grad_norm = accelerator.clip_grad_norm_(
                         layers_to_optimize, args.max_grad_norm
                     )
                 optimizer.step()
@@ -448,28 +633,30 @@ def main(args):
             global_step += 1
             progress_bar.update(1)
             logs = {
-                "train/loss": loss.detach().item(),
-                "train/l2": loss_l2.detach().item(),
-                "train/lpips": loss_lpips.detach().item(),
-                "train/gram": loss_gram.detach().item(),
-                "train/lr": lr_scheduler.get_last_lr()[0],
-                "train/epoch": epoch,
+                "loss": _gather_mean(accelerator, loss),
+                "opt_step": 1,
+                "grad_norm": _gather_mean(accelerator, grad_norm),
+                "l2": _gather_mean(accelerator, loss_l2),
+                "lpips": _gather_mean(accelerator, loss_lpips),
+                "gram": _gather_mean(accelerator, loss_gram),
+                "lr": lr_scheduler.get_last_lr()[0],
             }
             progress_bar.set_postfix(
-                loss=f"{logs['train/loss']:.4f}",
-                lpips=f"{logs['train/lpips']:.4f}",
+                loss=f"{logs['loss']:.4f}",
+                lpips=f"{logs['lpips']:.4f}",
             )
 
+            training_panels = []
             if accelerator.is_main_process and _interval_due(
                 global_step, args.viz_freq
             ):
-                logs["train/panels"] = [
-                    wandb.Image(
-                        _image_panel(conditioning, target, prediction, index),
-                        caption=(
-                            f"{batch['record_id'][index]} | corrupt, reference, "
-                            "clean, restored render, restored reference"
-                        ),
+                training_panels = [
+                    _image_panel(
+                        conditioning,
+                        target,
+                        prediction,
+                        index,
+                        str(batch["record_id"][index]),
                     )
                     for index in range(batch_size)
                 ]
@@ -494,22 +681,34 @@ def main(args):
 
             if _interval_due(global_step, args.eval_freq):
                 accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    logs.update(
-                        _run_validation(
-                            accelerator,
-                            net_difix,
-                            net_lpips,
-                            dataloader_val,
-                            weight_dtype,
-                            args.num_samples_eval,
-                            args.num_validation_panel_samples,
-                        )
-                    )
+                _run_validation(
+                    accelerator,
+                    net_difix,
+                    dataloader_val,
+                    weight_dtype,
+                    args.num_samples_eval,
+                    args.num_validation_panel_samples,
+                    args.output_dir,
+                    global_step,
+                )
                 accelerator.wait_for_everyone()
 
             if accelerator.is_main_process and args.report_to != "none":
                 accelerator.log(logs, step=global_step)
+                for index, panel in enumerate(training_panels):
+                    for tracker in accelerator.trackers:
+                        try:
+                            _log_image(
+                                tracker,
+                                f"train/panels/pair_{index:02d}",
+                                panel,
+                                global_step,
+                            )
+                        except Exception as exc:
+                            print(
+                                "Tracker training-panel upload failed "
+                                f"({tracker.name}, pair {index}): {exc}"
+                            )
 
             if global_step >= args.max_train_steps:
                 break
@@ -618,7 +817,7 @@ def parse_args():
     parser.add_argument(
         "--report_to",
         default="wandb",
-        choices=["wandb", "tensorboard", "all", "none"],
+        choices=["wandb", "tensorboard", "clearml", "all", "none"],
     )
     parser.add_argument(
         "--mixed_precision",
