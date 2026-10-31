@@ -509,6 +509,11 @@ def main(args):
                 "name": args.tracker_run_name,
                 "dir": args.output_dir,
             }
+        if args.report_to in ("clearml", "all"):
+            init_kwargs["clearml"] = {
+                "project_name": args.tracker_project_name,
+                "task_name": args.tracker_run_name,
+            }
         accelerator.init_trackers(
             args.tracker_project_name,
             config=dict(vars(args)),
