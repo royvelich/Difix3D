@@ -5,7 +5,7 @@ repo=/mnt/rvelich-ebs-2/repos/Difix3D-vanilla-our-data
 accelerate=/data/rvelich/venvs/geoquery-strict-uv/bin/accelerate
 train_manifest=/mnt/rvelich-ebs-2/datasets/difix_manifests/train4700_rank0.jsonl
 validation_manifest=/mnt/rvelich-ebs-2/datasets/difix_manifests/historical_val100.jsonl
-run_name=difix_vanilla_rank0_train4700_hist100_4gpu_10k_val5k_ohio_1031a
+run_name=difix_vanilla_rank0_train4700_hist100_4gpu_200k_val5k_ohio_1031a
 output_dir=/mnt/rvelich-ebs-2/training_runs/${run_name}
 
 for required_path in \
@@ -54,7 +54,7 @@ exec "$accelerate" launch \
   --validation_data_root=/data/rvelich/datasets/dl3dv_pairs_2x_20260922_val141_benchmark_s3to10_seed42 \
   --path_prefix_from=/mnt/nvme/rvelich/datasets \
   --path_prefix_to=/data/rvelich/datasets \
-  --max_train_steps=10000 \
+  --max_train_steps=200000 \
   --height=576 \
   --width=1024 \
   --learning_rate=2e-5 \
