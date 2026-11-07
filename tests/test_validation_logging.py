@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from train_difix import (  # noqa: E402
     _StridedValidationSampler,
     _aggregate_metric_rows,
+    _dataset_kwargs,
     _image_panel,
     _log_image,
     _log_metric_scalars,
@@ -84,6 +85,66 @@ class ValidationLoggingTest(unittest.TestCase):
         self.assertEqual(
             logged["restore-val/metrics/input_psnr_median"],
             9.0,
+        )
+
+    def test_named_validation_metric_namespace(self):
+        tracker = FakeClearMLTracker()
+        _log_metric_scalars(
+            tracker,
+            {"ours_ref_lpips": 0.25},
+            {"ours_ref_lpips": 0.2},
+            step=250,
+            namespace="restore-val/historical100",
+        )
+
+        logged = tracker.scalars[0][0]
+        self.assertEqual(
+            logged["restore-val/historical100/metrics/ours_ref_lpips"],
+            0.25,
+        )
+        self.assertEqual(
+            logged[
+                "restore-val/historical100/metrics/ours_ref_lpips_median"
+            ],
+            0.2,
+        )
+
+    def test_validation_dataset_can_override_path_remapping(self):
+        args = SimpleNamespace(
+            height=576,
+            width=1024,
+            prompt=None,
+            default_prompt="remove degradation",
+            data_root="/train",
+            path_prefix_from="/primary/source",
+            path_prefix_to="/primary/target",
+            wrapped_reference_fill="black",
+            wrapped_reference_builder_repo=None,
+            wrapped_reference_depth_cache_dir=None,
+            wrapped_reference_splat_radius=1,
+            cache_built_wrapped_references=False,
+            storage_backend="local",
+            s3_cache_dir=None,
+            s3_cache_images=False,
+            s3_max_pool_connections=32,
+            s3_tar_routes_path=None,
+        )
+
+        values = _dataset_kwargs(
+            args,
+            data_root="/historical",
+            path_prefix_from="/historical/source",
+            path_prefix_to="/historical/target",
+        )
+
+        self.assertEqual(values["data_root"], "/historical")
+        self.assertEqual(
+            values["path_prefix_from"],
+            "/historical/source",
+        )
+        self.assertEqual(
+            values["path_prefix_to"],
+            "/historical/target",
         )
 
     def test_labeled_panel_upload(self):

@@ -278,13 +278,31 @@ def _prepare_model_conditioning(
 
 
 def _log_image(tracker, tag, image, step):
+    image_path = (
+        os.fspath(image)
+        if isinstance(image, (str, os.PathLike))
+        else None
+    )
     if tracker.name == "tensorboard":
+        if image_path is not None:
+            from PIL import Image
+
+            with Image.open(image_path) as saved:
+                image = np.asarray(saved.convert("RGB"), dtype=np.uint8)
         tracker.writer.add_image(tag, image, step, dataformats="HWC")
     elif tracker.name == "wandb":
         import wandb
 
-        tracker.log({tag: wandb.Image(image)}, step=step)
+        tracker.log(
+            {tag: wandb.Image(image_path if image_path is not None else image)},
+            step=step,
+        )
     elif tracker.name == "clearml":
+        if image_path is not None:
+            from PIL import Image
+
+            with Image.open(image_path) as saved:
+                image = np.asarray(saved.convert("RGB"), dtype=np.uint8)
         tracker.log_images({tag: image}, step=step)
 
 
@@ -526,6 +544,8 @@ def _valid_pixel_metrics(prediction, target, validity, prefix):
 def _dataset_kwargs(
     args,
     data_root=None,
+    path_prefix_from=None,
+    path_prefix_to=None,
     wrapped_reference_cache_dir=None,
     wrapped_reference_depth_cache_dir=None,
 ):
@@ -536,8 +556,16 @@ def _dataset_kwargs(
         "default_prompt": args.default_prompt,
         "require_reference": True,
         "data_root": args.data_root if data_root is None else data_root,
-        "path_prefix_from": args.path_prefix_from,
-        "path_prefix_to": args.path_prefix_to,
+        "path_prefix_from": (
+            args.path_prefix_from
+            if path_prefix_from is None
+            else path_prefix_from
+        ),
+        "path_prefix_to": (
+            args.path_prefix_to
+            if path_prefix_to is None
+            else path_prefix_to
+        ),
         "wrapped_reference_cache_dir": wrapped_reference_cache_dir,
         "wrapped_reference_fill": args.wrapped_reference_fill,
         "wrapped_reference_builder_repo": (
@@ -562,22 +590,52 @@ def _dataset_kwargs(
     }
 
 
-def _build_validation_loader(args, tokenizer, process_index=0, num_processes=1):
-    validation_path = args.validation_dataset_path or args.dataset_path
+def _build_validation_loader(
+    args,
+    tokenizer,
+    process_index=0,
+    num_processes=1,
+    *,
+    validation_path=None,
+    data_root=None,
+    path_prefix_from=None,
+    path_prefix_to=None,
+    wrapped_reference_cache_dir=None,
+    wrapped_reference_depth_cache_dir=None,
+):
+    validation_path = (
+        validation_path
+        or args.validation_dataset_path
+        or args.dataset_path
+    )
     dataset = PairedDataset(
         dataset_path=validation_path,
         split=args.validation_split,
         tokenizer=tokenizer,
         **_dataset_kwargs(
             args,
-            data_root=args.validation_data_root or args.data_root,
+            data_root=(
+                data_root
+                or args.validation_data_root
+                or args.data_root
+            ),
+            path_prefix_from=path_prefix_from,
+            path_prefix_to=path_prefix_to,
             wrapped_reference_cache_dir=(
-                args.validation_wrapped_reference_cache_dir
-                or args.wrapped_reference_cache_dir
+                wrapped_reference_cache_dir
+                if wrapped_reference_cache_dir is not None
+                else (
+                    args.validation_wrapped_reference_cache_dir
+                    or args.wrapped_reference_cache_dir
+                )
             ),
             wrapped_reference_depth_cache_dir=(
-                args.validation_wrapped_reference_depth_cache_dir
-                or args.wrapped_reference_depth_cache_dir
+                wrapped_reference_depth_cache_dir
+                if wrapped_reference_depth_cache_dir is not None
+                else (
+                    args.validation_wrapped_reference_depth_cache_dir
+                    or args.wrapped_reference_depth_cache_dir
+                )
             ),
         ),
     )
@@ -610,11 +668,22 @@ def _run_validation(
     output_dir,
     step,
     args,
+    validation_name=None,
 ):
     model = accelerator.unwrap_model(net_difix)
     model.eval()
     local_rows = []
-    row_dir = os.path.join(output_dir, "eval", f"step_{step:09d}")
+    namespace = (
+        "restore-val"
+        if not validation_name
+        else f"restore-val/{validation_name}"
+    )
+    row_dir = os.path.join(
+        output_dir,
+        "eval",
+        *([validation_name] if validation_name else []),
+        f"step_{step:09d}",
+    )
     if accelerator.is_main_process:
         os.makedirs(row_dir, exist_ok=True)
     accelerator.wait_for_everyone()
@@ -813,7 +882,7 @@ def _run_validation(
         with open(summary_path, "w", encoding="utf-8") as handle:
             json.dump(
                 {
-                    "namespace": "restore-val",
+                    "namespace": namespace,
                     "step": step,
                     "num_pairs": len(rows),
                     "columns": list(panel_titles),
@@ -829,20 +898,16 @@ def _run_validation(
             )
 
         trackers = accelerator.trackers if accelerator.trackers else []
-        image_tag = "restore-val/" + " | ".join(panel_titles)
+        image_tag = f"{namespace}/panels"
         for row in rows:
             if row["row_path"] is None:
                 continue
-            from PIL import Image
-
-            with Image.open(row["row_path"]) as saved:
-                image = np.asarray(saved.convert("RGB"), dtype=np.uint8)
             for tracker in trackers:
                 try:
                     _log_image(
                         tracker,
                         f"{image_tag}/pair_{row['index']:02d}",
-                        image,
+                        row["row_path"],
                         step,
                     )
                 except Exception as exc:
@@ -858,6 +923,7 @@ def _run_validation(
                     average_metrics,
                     median_metrics,
                     step,
+                    namespace=namespace,
                 )
             except Exception as exc:
                 print(
@@ -883,7 +949,7 @@ def _run_validation(
                 f"LPIPS={average_metrics[f'{prefix}_lpips']:.3f}"
             )
         print(
-            f"[restore-val] step {step}: "
+            f"[{namespace}] step {step}: "
             + "  ".join(summary_bits)
             + f"  panels={row_dir}"
         )
@@ -1080,16 +1146,53 @@ def main(args):
         pin_memory=True,
         persistent_workers=args.dataloader_num_workers > 0,
     )
-    dataloader_val = (
-        _build_validation_loader(
-            args,
-            net_difix.tokenizer,
-            process_index=accelerator.process_index,
-            num_processes=accelerator.num_processes,
+    validation_loaders = []
+    if args.eval_freq > 0:
+        validation_loaders.append(
+            (
+                args.validation_name,
+                _build_validation_loader(
+                    args,
+                    net_difix.tokenizer,
+                    process_index=accelerator.process_index,
+                    num_processes=accelerator.num_processes,
+                ),
+            )
         )
-        if args.eval_freq > 0
-        else None
-    )
+        if args.secondary_validation_dataset_path is not None:
+            validation_loaders.append(
+                (
+                    args.secondary_validation_name,
+                    _build_validation_loader(
+                        args,
+                        net_difix.tokenizer,
+                        process_index=accelerator.process_index,
+                        num_processes=accelerator.num_processes,
+                        validation_path=(
+                            args.secondary_validation_dataset_path
+                        ),
+                        data_root=(
+                            args.secondary_validation_data_root
+                        ),
+                        path_prefix_from=(
+                            args.secondary_validation_path_prefix_from
+                        ),
+                        path_prefix_to=(
+                            args.secondary_validation_path_prefix_to
+                        ),
+                        wrapped_reference_cache_dir=(
+                            args.secondary_validation_wrapped_reference_cache_dir
+                            or args.validation_wrapped_reference_cache_dir
+                            or args.wrapped_reference_cache_dir
+                        ),
+                        wrapped_reference_depth_cache_dir=(
+                            args.secondary_validation_wrapped_reference_depth_cache_dir
+                            or args.validation_wrapped_reference_depth_cache_dir
+                            or args.wrapped_reference_depth_cache_dir
+                        ),
+                    ),
+                )
+            )
 
     net_lpips = lpips.LPIPS(net="vgg")
     net_lpips.requires_grad_(False)
@@ -1200,23 +1303,25 @@ def main(args):
     )
 
     if args.validate_on_start:
-        if dataloader_val is None:
+        if not validation_loaders:
             raise ValueError(
                 "--validate_on_start requires validation to be enabled "
                 "with --eval_freq > 0"
             )
         accelerator.wait_for_everyone()
-        _run_validation(
-            accelerator,
-            net_difix,
-            dataloader_val,
-            weight_dtype,
-            args.num_samples_eval,
-            args.num_validation_panel_samples,
-            args.output_dir,
-            global_step,
-            args,
-        )
+        for validation_name, dataloader_val in validation_loaders:
+            _run_validation(
+                accelerator,
+                net_difix,
+                dataloader_val,
+                weight_dtype,
+                args.num_samples_eval,
+                args.num_validation_panel_samples,
+                args.output_dir,
+                global_step,
+                args,
+                validation_name=validation_name,
+            )
         accelerator.wait_for_everyone()
 
     updates_per_epoch = math.ceil(
@@ -1415,17 +1520,19 @@ def main(args):
 
             if _interval_due(global_step, args.eval_freq):
                 accelerator.wait_for_everyone()
-                _run_validation(
-                    accelerator,
-                    net_difix,
-                    dataloader_val,
-                    weight_dtype,
-                    args.num_samples_eval,
-                    args.num_validation_panel_samples,
-                    args.output_dir,
-                    global_step,
-                    args,
-                )
+                for validation_name, dataloader_val in validation_loaders:
+                    _run_validation(
+                        accelerator,
+                        net_difix,
+                        dataloader_val,
+                        weight_dtype,
+                        args.num_samples_eval,
+                        args.num_validation_panel_samples,
+                        args.output_dir,
+                        global_step,
+                        args,
+                        validation_name=validation_name,
+                    )
                 accelerator.wait_for_everyone()
 
             if accelerator.is_main_process and args.report_to != "none":
@@ -1488,6 +1595,46 @@ def parse_args():
 
     parser.add_argument("--dataset_path", required=True)
     parser.add_argument("--validation_dataset_path", default=None)
+    parser.add_argument(
+        "--validation_name",
+        default=None,
+        help=(
+            "Optional short namespace for the primary validation set, "
+            "for example new100."
+        ),
+    )
+    parser.add_argument(
+        "--secondary_validation_dataset_path",
+        default=None,
+        help=(
+            "Optional second validation manifest evaluated independently "
+            "at every validation interval."
+        ),
+    )
+    parser.add_argument(
+        "--secondary_validation_name",
+        default="secondary",
+    )
+    parser.add_argument(
+        "--secondary_validation_data_root",
+        default=None,
+    )
+    parser.add_argument(
+        "--secondary_validation_path_prefix_from",
+        default=None,
+    )
+    parser.add_argument(
+        "--secondary_validation_path_prefix_to",
+        default=None,
+    )
+    parser.add_argument(
+        "--secondary_validation_wrapped_reference_cache_dir",
+        default=None,
+    )
+    parser.add_argument(
+        "--secondary_validation_wrapped_reference_depth_cache_dir",
+        default=None,
+    )
     parser.add_argument("--train_split", default="train")
     parser.add_argument("--validation_split", default="test")
     parser.add_argument("--data_root", default=None)
