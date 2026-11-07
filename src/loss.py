@@ -50,7 +50,9 @@ def gram_matrix(tensor):
         torch.Tensor: Gram matrix of the input tensor.
     """
     b, d, h, w = tensor.size()
-    tensor = tensor.view(b * d, h * w)  # Reshape tensor for matrix multiplication
+    # VGG activations are not guaranteed to be contiguous (for example under
+    # mixed precision or channels-last kernels), so view() is unsafe here.
+    tensor = tensor.reshape(b * d, h * w)
     gram = torch.mm(tensor, tensor.t())  # Compute Gram matrix
     return gram
 
