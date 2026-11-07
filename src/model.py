@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import torch
+import torch.utils.checkpoint
 from torchvision import transforms
 from transformers import AutoTokenizer, CLIPTextModel
 from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler
@@ -12,6 +13,11 @@ from peft import LoraConfig
 p = "src/"
 sys.path.append(p)
 from einops import rearrange, repeat
+from sparse_attention import (
+    build_sparse_attention_context,
+    parse_attention_matrix,
+    parse_attention_modes,
+)
 
 
 def make_1step_sched(pretrained_model_name_or_path):
@@ -39,10 +45,22 @@ def my_vae_encoder_fwd(self, sample):
 
 
 def my_vae_decoder_fwd(self, sample, latent_embeds=None):
+    def run_block(block, value):
+        if self.training and getattr(self, "gradient_checkpointing", False):
+            return torch.utils.checkpoint.checkpoint(
+                lambda tensor, active_block=block: active_block(
+                    tensor,
+                    latent_embeds,
+                ),
+                value,
+                use_reentrant=False,
+            )
+        return block(value, latent_embeds)
+
     sample = self.conv_in(sample)
     upscale_dtype = next(iter(self.up_blocks.parameters())).dtype
     # middle
-    sample = self.mid_block(sample, latent_embeds)
+    sample = run_block(self.mid_block, sample)
     sample = sample.to(upscale_dtype)
     if not self.ignore_skip:
         skip_convs = [self.skip_conv_1, self.skip_conv_2, self.skip_conv_3, self.skip_conv_4]
@@ -51,10 +69,10 @@ def my_vae_decoder_fwd(self, sample, latent_embeds=None):
             skip_in = skip_convs[idx](self.incoming_skip_acts[::-1][idx] * self.gamma)
             # add skip
             sample = sample + skip_in
-            sample = up_block(sample, latent_embeds)
+            sample = run_block(up_block, sample)
     else:
         for idx, up_block in enumerate(self.up_blocks):
-            sample = up_block(sample, latent_embeds)
+            sample = run_block(up_block, sample)
     # post-process
     if latent_embeds is None:
         sample = self.conv_norm_out(sample)
@@ -146,9 +164,47 @@ class Difix(torch.nn.Module):
         mv_unet=False,
         timestep=999,
         base_model_name_or_path="stabilityai/sd-turbo",
+        sparse_mv_attention=False,
+        view_attention_query_modes="all,all,valid_only",
+        view_attention_matrix=(
+            "all,all,valid_only;"
+            "all,all,valid_only;"
+            "all,all,valid_only"
+        ),
+        wrapped_reference_patch_valid_fraction=0.8,
+        wrapped_reference_denoise_mask="all",
     ):
         super().__init__()
         self.base_model_name_or_path = base_model_name_or_path
+        self.sparse_mv_attention = bool(sparse_mv_attention)
+        self.wrapped_reference_patch_valid_fraction = float(
+            wrapped_reference_patch_valid_fraction
+        )
+        if not 0.0 <= self.wrapped_reference_patch_valid_fraction <= 1.0:
+            raise ValueError(
+                "wrapped_reference_patch_valid_fraction must be in [0,1]"
+            )
+        self.wrapped_reference_denoise_mask = str(
+            wrapped_reference_denoise_mask
+        )
+        if self.wrapped_reference_denoise_mask not in ("all", "valid_only"):
+            raise ValueError(
+                "wrapped_reference_denoise_mask must be all|valid_only"
+            )
+        self.view_attention_query_modes = parse_attention_modes(
+            view_attention_query_modes,
+            expected=3,
+            name="view_attention_query_modes",
+        )
+        self.view_attention_matrix = parse_attention_matrix(
+            view_attention_matrix,
+            expected=3,
+            name="view_attention_matrix",
+        )
+        if self.sparse_mv_attention and not mv_unet:
+            raise ValueError(
+                "sparse_mv_attention requires the DiFix multi-view U-Net"
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(
             base_model_name_or_path, subfolder="tokenizer"
         )
@@ -236,6 +292,8 @@ class Difix(torch.nn.Module):
             self.target_modules_vae = target_modules_vae
 
         self.unet, self.vae = unet, vae
+        if self.sparse_mv_attention:
+            self.vae.enable_gradient_checkpointing()
         self.vae.decoder.gamma = 1
         self.register_buffer(
             "timesteps",
@@ -271,7 +329,14 @@ class Difix(torch.nn.Module):
         self.vae.decoder.skip_conv_3.requires_grad_(True)
         self.vae.decoder.skip_conv_4.requires_grad_(True)
 
-    def forward(self, x, timesteps=None, prompt=None, prompt_tokens=None):
+    def forward(
+        self,
+        x,
+        timesteps=None,
+        prompt=None,
+        prompt_tokens=None,
+        wrapped_reference_validity=None,
+    ):
         # either the prompt or the prompt_tokens should be provided
         assert (prompt is None) != (prompt_tokens is None), "Either prompt or prompt_tokens should be provided"
         active_timesteps = self.timesteps if timesteps is None else timesteps
@@ -291,6 +356,36 @@ class Difix(torch.nn.Module):
         x = rearrange(x, 'b v c h w -> (b v) c h w')
         z = self.vae.encode(x).latent_dist.sample() * self.vae.config.scaling_factor 
         caption_enc = repeat(caption_enc, 'b n c -> (b v) n c', v=num_views)
+
+        sparse_context = None
+        if self.sparse_mv_attention:
+            if num_views != 3:
+                raise ValueError(
+                    "sparse_mv_attention requires exactly three views: "
+                    "render, reference, wrapped reference"
+                )
+            if wrapped_reference_validity is None:
+                raise ValueError(
+                    "sparse_mv_attention requires wrapped_reference_validity"
+                )
+            sparse_context = build_sparse_attention_context(
+                wrapped_reference_validity.to(device=z.device),
+                num_views=num_views,
+                wrapped_view_index=2,
+                latent_shape=tuple(z.shape[-2:]),
+                num_levels=int(self.unet.num_upsamplers) + 1,
+                valid_fraction_threshold=(
+                    self.wrapped_reference_patch_valid_fraction
+                ),
+                query_modes=self.view_attention_query_modes,
+                key_modes=self.view_attention_matrix,
+            )
+
+        if hasattr(self.unet, "set_multiview_attention_context"):
+            self.unet.set_multiview_attention_context(
+                sparse_context,
+                num_views=num_views,
+            )
         
         unet_input = z
         
@@ -309,6 +404,42 @@ class Difix(torch.nn.Module):
         z_denoised = self.sched.step(
             model_pred, scheduler_timestep, z, return_dict=True
         ).prev_sample
+        if self.wrapped_reference_denoise_mask == "valid_only":
+            if num_views != 3 or sparse_context is None:
+                raise ValueError(
+                    "valid_only wrapped denoising requires three-view sparse "
+                    "attention and wrapped-reference validity"
+                )
+            latent_validity = sparse_context.validity(
+                tuple(z.shape[-2:]),
+                batch_size=x.shape[0] // num_views,
+                device=z.device,
+            )[:, 2].reshape(
+                x.shape[0] // num_views,
+                1,
+                *z.shape[-2:],
+            )
+            z_views = rearrange(
+                z, "(b v) c h w -> b v c h w", v=num_views
+            )
+            denoised_views = rearrange(
+                z_denoised, "(b v) c h w -> b v c h w", v=num_views
+            )
+            denoised_wrapped = torch.where(
+                latent_validity,
+                denoised_views[:, 2],
+                z_views[:, 2],
+            )
+            denoised_views = torch.cat(
+                [
+                    denoised_views[:, :2],
+                    denoised_wrapped.unsqueeze(1),
+                ],
+                dim=1,
+            )
+            z_denoised = rearrange(
+                denoised_views, "b v c h w -> (b v) c h w"
+            )
         self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
         output_image = (self.vae.decode(z_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
         output_image = rearrange(output_image, '(b v) c h w -> b v c h w', v=num_views)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -56,7 +57,55 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 from diffusers.models.attention import BasicTransformerBlock, _chunked_feed_forward
+from diffusers.models.transformer_2d import Transformer2DModel
 from einops import rearrange
+
+from sparse_attention import (
+    SparseMultiViewAttentionContext,
+    sparse_multiview_attention,
+)
+
+
+def _capture_transformer_spatial_shape(module, args, kwargs):
+    hidden_states = (
+        kwargs.get("hidden_states")
+        if kwargs
+        else None
+    )
+    if hidden_states is None and args:
+        hidden_states = args[0]
+    if hidden_states is None or hidden_states.ndim != 4:
+        raise ValueError(
+            "DiFix multi-view attention requires Transformer2DModel to "
+            "receive a dense [B,C,H,W] feature map"
+        )
+    spatial_shape = tuple(int(value) for value in hidden_states.shape[-2:])
+    for block in module.transformer_blocks:
+        block._difix_spatial_shape = spatial_shape
+
+
+def _install_multiview_attention(unet):
+    """Patch only this U-Net's transformer blocks, not Diffusers globally."""
+
+    transformer_blocks = []
+    for module in unet.modules():
+        if isinstance(module, BasicTransformerBlock):
+            module.forward = MethodType(new_forward, module)
+            module._difix_num_views = 2
+            module._difix_sparse_attention_context = None
+            module._difix_spatial_shape = None
+            transformer_blocks.append(module)
+        if (
+            isinstance(module, Transformer2DModel)
+            and not getattr(module, "_difix_spatial_hook_installed", False)
+        ):
+            module.register_forward_pre_hook(
+                _capture_transformer_spatial_shape,
+                with_kwargs=True,
+            )
+            module._difix_spatial_hook_installed = True
+    unet._difix_transformer_blocks = transformer_blocks
+
 
 def new_forward(
     self,
@@ -71,8 +120,21 @@ def new_forward(
 ) -> torch.FloatTensor:
     # Notice that normalization is always applied before the real computation in the following blocks.
     # 0. Self-Attention
-    
-    num_views = 2   # Assuming 2 views for simplicity, can be parameterized later
+
+    sparse_context = getattr(
+        self, "_difix_sparse_attention_context", None
+    )
+    num_views = (
+        sparse_context.num_views
+        if sparse_context is not None
+        else int(getattr(self, "_difix_num_views", 2))
+    )
+    if hidden_states.shape[0] % num_views:
+        raise ValueError(
+            "DiFix multi-view batch must be interleaved as (batch, view): "
+            f"leading dimension {hidden_states.shape[0]} is not divisible "
+            f"by num_views={num_views}"
+        )
     hidden_states = rearrange(hidden_states, "(b v) n d -> b (v n) d", v=num_views)
     batch_size = hidden_states.shape[0]
 
@@ -106,12 +168,37 @@ def new_forward(
     cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
     gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
-    attn_output = self.attn1(
-        norm_hidden_states,
-        encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
-        attention_mask=attention_mask,
-        **cross_attention_kwargs,
-    )
+    if sparse_context is None:
+        attn_output = self.attn1(
+            norm_hidden_states,
+            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+            attention_mask=attention_mask,
+            **cross_attention_kwargs,
+        )
+    else:
+        if self.only_cross_attention:
+            raise ValueError(
+                "Sparse DiFix multi-view attention supports attn1 "
+                "self-attention blocks only"
+            )
+        if attention_mask is not None:
+            raise ValueError(
+                "Sparse DiFix attn1 does not accept an additional dense "
+                "attention_mask"
+            )
+        spatial_shape = getattr(self, "_difix_spatial_shape", None)
+        if spatial_shape is None:
+            raise RuntimeError(
+                "Missing U-Net spatial shape for sparse attention; the "
+                "Transformer2DModel pre-hook was not installed"
+            )
+        attn_output = sparse_multiview_attention(
+            self.attn1,
+            norm_hidden_states,
+            context=sparse_context,
+            spatial_shape=spatial_shape,
+            lora_scale=lora_scale,
+        )
     if self.use_ada_layer_norm_zero:
         attn_output = gate_msa.unsqueeze(1) * attn_output
     elif self.use_ada_layer_norm_single:
@@ -184,10 +271,6 @@ def new_forward(
         hidden_states = hidden_states.squeeze(1)
 
     return hidden_states
-
-# Monkey-patch the class
-BasicTransformerBlock.forward = new_forward
-
 
 @dataclass
 class UNet2DConditionOutput(BaseOutput):
@@ -753,6 +836,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 positive_len=positive_len, out_dim=cross_attention_dim, feature_type=feature_type
             )
 
+        _install_multiview_attention(self)
+
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
         r"""
@@ -896,6 +981,27 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
     def _set_gradient_checkpointing(self, module, value=False):
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
+
+    def set_multiview_attention_context(
+        self,
+        context: Optional[SparseMultiViewAttentionContext],
+        *,
+        num_views: Optional[int] = None,
+    ):
+        """Configure view grouping and optional sparse routing for one forward."""
+
+        if context is not None:
+            active_num_views = int(context.num_views)
+        elif num_views is not None:
+            active_num_views = int(num_views)
+        else:
+            active_num_views = 2
+        if active_num_views < 1:
+            raise ValueError("num_views must be positive")
+
+        for block in self._difix_transformer_blocks:
+            block._difix_num_views = active_num_views
+            block._difix_sparse_attention_context = context
 
     def enable_freeu(self, s1, s2, b1, b2):
         r"""Enables the FreeU mechanism from https://arxiv.org/abs/2309.11497.
