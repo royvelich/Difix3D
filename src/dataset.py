@@ -13,6 +13,29 @@ from torchvision import transforms as T
 from torchvision.transforms import InterpolationMode
 import torchvision.transforms.functional as F
 
+try:
+    from .storage import (
+        configure_storage,
+        is_s3_uri,
+        join_location,
+        load_pil_image,
+        location_exists,
+        materialize,
+        normalize_location,
+        normalize_logical_path,
+    )
+except ImportError:
+    from storage import (
+        configure_storage,
+        is_s3_uri,
+        join_location,
+        load_pil_image,
+        location_exists,
+        materialize,
+        normalize_location,
+        normalize_logical_path,
+    )
+
 
 class IndexedJsonlRecords:
     """Random-access JSONL backed by a shared, memory-mapped uint64 index."""
@@ -112,10 +135,33 @@ class PairedDataset(torch.utils.data.Dataset):
         wrapped_reference_builder_repo=None,
         wrapped_reference_depth_cache_dir=None,
         wrapped_reference_splat_radius=1,
+        cache_built_wrapped_references=True,
+        storage_backend="local",
+        s3_cache_dir=None,
+        s3_cache_images=False,
+        s3_max_pool_connections=32,
+        s3_tar_routes_path=None,
     ):
         super().__init__()
 
-        self.dataset_path = Path(dataset_path).expanduser().resolve()
+        self._storage_settings = configure_storage(
+            backend=storage_backend,
+            cache_dir=s3_cache_dir,
+            cache_images=s3_cache_images,
+            max_pool_connections=s3_max_pool_connections,
+            tar_routes_path=s3_tar_routes_path,
+        )
+        dataset_path_text = os.fspath(dataset_path)
+        if (
+            is_s3_uri(dataset_path_text)
+            and dataset_path_text.lower().endswith((".jsonl", ".ndjson"))
+        ):
+            raise ValueError(
+                "S3 JSONL manifests are not supported because their mmap "
+                "index must sit beside the manifest; materialize both files "
+                "locally and pass the local JSONL path."
+            )
+        self.dataset_path = Path(materialize(dataset_path_text)).resolve()
         self.record_store = None
         self.records = None
         if self.dataset_path.suffix.lower() in {".jsonl", ".ndjson"}:
@@ -159,7 +205,7 @@ class PairedDataset(torch.utils.data.Dataset):
         self.default_prompt = default_prompt
         self.require_reference = require_reference
         self.wrapped_reference_cache_dir = (
-            Path(wrapped_reference_cache_dir).expanduser()
+            normalize_location(wrapped_reference_cache_dir)
             if wrapped_reference_cache_dir is not None
             else None
         )
@@ -174,10 +220,23 @@ class PairedDataset(torch.utils.data.Dataset):
             else None
         )
         self.wrapped_reference_depth_cache_dir = (
-            Path(wrapped_reference_depth_cache_dir).expanduser().resolve()
+            normalize_location(wrapped_reference_depth_cache_dir)
             if wrapped_reference_depth_cache_dir is not None
             else None
         )
+        self.cache_built_wrapped_references = bool(
+            cache_built_wrapped_references
+        )
+        if (
+            self.cache_built_wrapped_references
+            and self.wrapped_reference_cache_dir is not None
+            and is_s3_uri(self.wrapped_reference_cache_dir)
+            and self.wrapped_reference_builder_repo is not None
+        ):
+            raise ValueError(
+                "Online wrapped-reference cache writes require a local "
+                "--wrapped_reference_cache_dir"
+            )
         self.wrapped_reference_splat_radius = int(
             wrapped_reference_splat_radius
         )
@@ -195,9 +254,9 @@ class PairedDataset(torch.utils.data.Dataset):
                 "wrapped_reference_depth_cache_dir must be provided together"
             )
         self.data_root = (
-            Path(data_root).expanduser().resolve()
+            normalize_location(data_root)
             if data_root is not None
-            else self.dataset_path.parent
+            else str(self.dataset_path.parent)
         )
 
         if (path_prefix_from is None) != (path_prefix_to is None):
@@ -227,26 +286,26 @@ class PairedDataset(torch.utils.data.Dataset):
         ):
             path = self.path_prefix_to + path[len(self.path_prefix_from) :]
 
-        resolved = Path(path)
-        if not resolved.is_absolute():
-            resolved = self.data_root / resolved
-        return resolved
+        if is_s3_uri(path):
+            return normalize_location(path)
+        if not os.path.isabs(path):
+            return normalize_location(join_location(self.data_root, path))
+        return normalize_location(path)
 
     def _load_image(self, raw_path, field_name, record_id):
         path = self._resolve_path(raw_path)
         try:
-            with Image.open(path) as image:
-                image = image.convert("RGB")
-                # Match PixelDiT preprocessing exactly: resize the PIL image
-                # before converting it to a tensor. Resizing the float tensor
-                # produces slightly different pixels.
-                image = F.resize(
-                    image,
-                    self.image_size,
-                    interpolation=InterpolationMode.BILINEAR,
-                    antialias=True,
-                )
-                tensor = F.to_tensor(image)
+            image = load_pil_image(path, mode="RGB")
+            # Match PixelDiT preprocessing exactly: resize the PIL image
+            # before converting it to a tensor. Resizing the float tensor
+            # produces slightly different pixels.
+            image = F.resize(
+                image,
+                self.image_size,
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            tensor = F.to_tensor(image)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load {field_name} for record {record_id!r}: {path}"
@@ -298,10 +357,15 @@ class PairedDataset(torch.utils.data.Dataset):
         seen = set()
         for key in keys:
             for path in (
-                self.wrapped_reference_cache_dir
-                / key[:2]
-                / f"{key}.npz",
-                self.wrapped_reference_cache_dir / f"{key}.npz",
+                join_location(
+                    self.wrapped_reference_cache_dir,
+                    key[:2],
+                    f"{key}.npz",
+                ),
+                join_location(
+                    self.wrapped_reference_cache_dir,
+                    f"{key}.npz",
+                ),
             ):
                 if path not in seen:
                     candidates.append(path)
@@ -340,6 +404,19 @@ class PairedDataset(torch.utils.data.Dataset):
                 "Failed to import the PixelDiT wrapped-reference builder "
                 f"from {repo}"
             ) from exc
+        if self._storage_settings.backend == "s3_stream":
+            pixeldit_storage = importlib.import_module(
+                "restore.data.storage"
+            )
+            pixeldit_storage.configure_storage(
+                backend=self._storage_settings.backend,
+                cache_dir=self._storage_settings.cache_dir,
+                cache_images=self._storage_settings.cache_images,
+                max_pool_connections=(
+                    self._storage_settings.max_pool_connections
+                ),
+                tar_routes_path=self._storage_settings.tar_routes_path,
+            )
 
         resolved_clean = str(self._resolve_path(record["target_image"]))
         resolved_corrupt = str(self._resolve_path(record["image"]))
@@ -378,10 +455,10 @@ class PairedDataset(torch.utils.data.Dataset):
         # fail before any .npz file is written. A real no-overlap view may
         # still produce an all-invalid warp after this check.
         geometry_map = pixeldit_record.get("geometry_path_map") or {}
-        source_reference = os.path.normpath(
+        source_reference = normalize_logical_path(
             str(geometry_map.get(resolved_reference, resolved_reference))
         )
-        source_clean = os.path.normpath(
+        source_clean = normalize_logical_path(
             str(geometry_map.get(resolved_clean, resolved_clean))
         )
         if source_reference != source_clean:
@@ -405,11 +482,20 @@ class PairedDataset(torch.utils.data.Dataset):
                 fill="zero",
             )
 
+        if not self.cache_built_wrapped_references:
+            return wrapped, validity, "<online-not-cached>"
+
         key = self._sha1_cache_key(
             resolved_clean,
             resolved_corrupt,
         )
-        path = self.wrapped_reference_cache_dir / key[:2] / f"{key}.npz"
+        path = Path(
+            join_location(
+                self.wrapped_reference_cache_dir,
+                key[:2],
+                f"{key}.npz",
+            )
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         rgb = (
             (wrapped.float().clamp(-1, 1) + 1.0)
@@ -446,17 +532,36 @@ class PairedDataset(torch.utils.data.Dataset):
         candidates = self._wrapped_reference_cache_candidates(
             record_id, record
         )
-        path = next((path for path in candidates if path.is_file()), None)
+        path = next(
+            (path for path in candidates if location_exists(path)),
+            None,
+        )
         if (
             path is None
             and self.wrapped_reference_builder_repo is not None
         ):
-            path = self._build_wrapped_reference(
+            built = self._build_wrapped_reference(
                 record_id,
                 record,
                 corrupt,
                 reference,
             )
+            if isinstance(built, tuple):
+                wrapped, validity_tensor, source = built
+                validity_tensor = validity_tensor.bool()
+                if self.wrapped_reference_fill == "black":
+                    fallback = torch.full_like(wrapped, -1.0)
+                elif self.wrapped_reference_fill == "zero":
+                    fallback = torch.zeros_like(wrapped)
+                else:
+                    fallback = corrupt
+                wrapped = torch.where(
+                    validity_tensor,
+                    wrapped,
+                    fallback,
+                )
+                return wrapped, validity_tensor.float(), source
+            path = built
         if path is None:
             attempted = ", ".join(str(path) for path in candidates)
             raise FileNotFoundError(
@@ -464,7 +569,8 @@ class PairedDataset(torch.utils.data.Dataset):
                 f"tried: {attempted}"
             )
 
-        with np.load(path, allow_pickle=False) as data:
+        local_path = materialize(path)
+        with np.load(local_path, allow_pickle=False) as data:
             required = {"rgb", "validity", "shape"}
             if not required.issubset(data.files):
                 raise RuntimeError(

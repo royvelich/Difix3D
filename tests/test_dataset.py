@@ -458,6 +458,73 @@ class PairedDatasetTest(unittest.TestCase):
             )
             self.assertTrue(any((root / "cache").rglob("*.npz")))
 
+    def test_online_builder_can_skip_unbounded_wrapped_rgb_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_image(root / "corrupt.png", (255, 0, 0))
+            self._write_image(root / "clean.png", (0, 255, 0))
+            self._write_image(root / "ref.png", (0, 0, 255))
+            manifest_path = root / "data.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "train": [
+                            {
+                                "id": "pair-0",
+                                "image": "corrupt.png",
+                                "target_image": "clean.png",
+                                "ref_image": "ref.png",
+                                "camera": {
+                                    "width": 6,
+                                    "height": 4,
+                                    "K": torch.eye(3).tolist(),
+                                    "camtoworld": torch.eye(4).tolist(),
+                                },
+                            }
+                        ]
+                    }
+                )
+            )
+            fake_builder = SimpleNamespace(
+                load_omnivggt_depth_window=mock.Mock(
+                    return_value=(
+                        torch.ones(1, 4, 6),
+                        torch.ones(1, 4, 6),
+                        torch.eye(3),
+                        torch.eye(4),
+                    )
+                ),
+                build_warped_reference=mock.Mock(
+                    return_value=(
+                        torch.zeros(3, 4, 6),
+                        torch.ones(1, 4, 6),
+                    )
+                ),
+            )
+            dataset = PairedDataset(
+                manifest_path,
+                "train",
+                height=4,
+                width=6,
+                wrapped_reference_cache_dir=root / "cache",
+                wrapped_reference_builder_repo=root,
+                wrapped_reference_depth_cache_dir=root / "depth",
+                cache_built_wrapped_references=False,
+            )
+
+            with mock.patch.object(
+                dataset_module.importlib,
+                "import_module",
+                return_value=fake_builder,
+            ):
+                item = dataset[0]
+
+            self.assertEqual(
+                item["wrapped_reference_cache_path"],
+                "<online-not-cached>",
+            )
+            self.assertFalse(any((root / "cache").rglob("*.npz")))
+
 
 if __name__ == "__main__":
     unittest.main()

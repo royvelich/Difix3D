@@ -131,6 +131,20 @@ def main(args):
                     "ref_image": record["ref_image"],
                     "prompt": record.get("prompt") or args.default_prompt,
                 }
+                # Online wrapped-reference construction needs the target
+                # camera; reference calibration is stored in the Variant-B
+                # depth entry. Keep only the optional geometry identity fields
+                # that construction needs, not the much larger neighbor list.
+                for field in (
+                    "camera",
+                    "scene",
+                    "scene_scale",
+                    "geometry_corrupted",
+                    "geometry_ref_image",
+                    "wrapped_reference_cache_key",
+                ):
+                    if record.get(field) is not None:
+                        compact_record[field] = record[field]
                 encoded = (
                     json.dumps(
                         compact_record,
