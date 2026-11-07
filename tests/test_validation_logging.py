@@ -11,6 +11,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from train_difix import (  # noqa: E402
+    _StridedValidationSampler,
     _aggregate_metric_rows,
     _image_panel,
     _log_image,
@@ -37,6 +38,21 @@ class FakeClearMLTracker:
 
 
 class ValidationLoggingTest(unittest.TestCase):
+    def test_validation_sampler_partitions_without_duplicates(self):
+        dataset = list(range(10))
+        partitions = [
+            list(_StridedValidationSampler(dataset, rank, 3))
+            for rank in range(3)
+        ]
+
+        self.assertEqual(partitions[0], [0, 3, 6, 9])
+        self.assertEqual(partitions[1], [1, 4, 7])
+        self.assertEqual(partitions[2], [2, 5, 8])
+        self.assertEqual(
+            sorted(index for partition in partitions for index in partition),
+            list(range(10)),
+        )
+
     def test_exact_mean_median_and_clearml_tags(self):
         rows = [
             {

@@ -84,6 +84,36 @@ def _find_resume_checkpoint(resume):
     raise ValueError(f"Invalid resume checkpoint or directory: {resume}")
 
 
+class _StridedValidationSampler(torch.utils.data.Sampler):
+    """Partition validation indices across ranks without padding duplicates."""
+
+    def __init__(self, dataset, process_index, num_processes):
+        if num_processes < 1:
+            raise ValueError("num_processes must be >= 1")
+        if process_index < 0 or process_index >= num_processes:
+            raise ValueError(
+                "process_index must be in [0, num_processes)"
+            )
+        self.dataset = dataset
+        self.process_index = int(process_index)
+        self.num_processes = int(num_processes)
+
+    def __iter__(self):
+        return iter(
+            range(
+                self.process_index,
+                len(self.dataset),
+                self.num_processes,
+            )
+        )
+
+    def __len__(self):
+        remaining = len(self.dataset) - self.process_index
+        if remaining <= 0:
+            return 0
+        return (remaining + self.num_processes - 1) // self.num_processes
+
+
 def _image_panel(
     conditioning,
     target,
@@ -532,7 +562,7 @@ def _dataset_kwargs(
     }
 
 
-def _build_validation_loader(args, tokenizer):
+def _build_validation_loader(args, tokenizer, process_index=0, num_processes=1):
     validation_path = args.validation_dataset_path or args.dataset_path
     dataset = PairedDataset(
         dataset_path=validation_path,
@@ -556,10 +586,15 @@ def _build_validation_loader(args, tokenizer):
             f"Validation split {args.validation_split!r} in "
             f"{validation_path} is empty"
         )
+    sampler = _StridedValidationSampler(
+        dataset,
+        process_index=process_index,
+        num_processes=num_processes,
+    )
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=1,
-        shuffle=False,
+        sampler=sampler,
         num_workers=args.validation_num_workers,
         pin_memory=True,
     )
@@ -584,11 +619,13 @@ def _run_validation(
         os.makedirs(row_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    for sample_index, batch in enumerate(dataloader):
+    for local_index, batch in enumerate(dataloader):
+        sample_index = (
+            accelerator.process_index
+            + local_index * accelerator.num_processes
+        )
         if sample_index >= num_samples:
             break
-        if sample_index % accelerator.num_processes != accelerator.process_index:
-            continue
 
         # Keep source pixels in fp32 for the GT oracle and validation metrics.
         # Autocast handles the model call without rounding the decision inputs.
@@ -1044,7 +1081,12 @@ def main(args):
         persistent_workers=args.dataloader_num_workers > 0,
     )
     dataloader_val = (
-        _build_validation_loader(args, net_difix.tokenizer)
+        _build_validation_loader(
+            args,
+            net_difix.tokenizer,
+            process_index=accelerator.process_index,
+            num_processes=accelerator.num_processes,
+        )
         if args.eval_freq > 0
         else None
     )
@@ -1156,6 +1198,26 @@ def main(args):
         desc="Steps",
         disable=not accelerator.is_local_main_process,
     )
+
+    if args.validate_on_start:
+        if dataloader_val is None:
+            raise ValueError(
+                "--validate_on_start requires validation to be enabled "
+                "with --eval_freq > 0"
+            )
+        accelerator.wait_for_everyone()
+        _run_validation(
+            accelerator,
+            net_difix,
+            dataloader_val,
+            weight_dtype,
+            args.num_samples_eval,
+            args.num_validation_panel_samples,
+            args.output_dir,
+            global_step,
+            args,
+        )
+        accelerator.wait_for_everyone()
 
     updates_per_epoch = math.ceil(
         len(dataloader_train) / args.gradient_accumulation_steps
@@ -1701,6 +1763,15 @@ def parse_args():
         default=True,
     )
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--validate_on_start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run validation immediately after initialization or checkpoint "
+            "resume, before the first training batch."
+        ),
+    )
     return parser.parse_args()
 
 

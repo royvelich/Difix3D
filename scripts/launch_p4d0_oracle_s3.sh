@@ -3,12 +3,14 @@ set -Eeuo pipefail
 
 repo=/home/rvelich/repos/Difix3D-oracle
 python=/home/rvelich/venvs/difix-experiments/bin/python
-run_name=difix_oracle_lpips3x3_rg05_v95_sparsejoint_wrapvalid80_bs1x8_lr2e5_200k_val5k_p4d0_1107a
+run_name=difix_oracle_lpips3x3_rg05_v95_sparsejoint_wrapvalid80_bs1x8_lr2e5_200k_val5k_p4d0_1107a_fix1
 output_dir=/home/rvelich/difix_runs/${run_name}
+resume_checkpoint=/home/rvelich/difix_runs/difix_oracle_lpips3x3_rg05_v95_sparsejoint_wrapvalid80_bs1x8_lr2e5_200k_val5k_p4d0_1107a/checkpoints/model_5000.pkl
 train_manifest=/home/rvelich/difix_data/manifests/train4700_rank0_geometry.jsonl
 train_root=s3://rvelich-data/datasets/dl3dv_pairs_2x_20261013_ohio1700_seed44/metadata/combined4700
 validation_manifest=s3://rvelich-data/datasets/dl3dv_pairs_2x_20261013_ohio1700_seed44/metadata/val100_scene_balanced_seed20261028/data.json
 validation_root=/mnt/nvme/rvelich/datasets/dl3dv_pairs_2x_20260922_val141_benchmark_s3to10_seed42
+validation_s3_root=s3://rvelich-data/datasets/dl3dv_pairs_2x_20261013_ohio1700_seed44/metadata/val100_scene_balanced_seed20261028
 wrapped_sentinel=/home/rvelich/difix_data/wrapped-online-disabled
 pixeldit_repo=/mnt/nvme/rvelich/repos/gs-pixel-refiner-3-wrapped-transplant-skips-1029
 s3_cache=/home/rvelich/difix_s3_cache
@@ -16,6 +18,7 @@ s3_routes=/mnt/nvme/rvelich/pixeldit-s3-routes/routes.json
 
 for required in \
   "$repo/src/train_difix.py" \
+  "$resume_checkpoint" \
   "$train_manifest" \
   "${train_manifest}.idx" \
   "$pixeldit_repo/restore/warped_reference.py" \
@@ -60,6 +63,8 @@ exec "$python" -m accelerate.commands.launch \
   --validation_split=test \
   --data_root="$train_root" \
   --validation_data_root="$validation_root" \
+  --path_prefix_from="$validation_root" \
+  --path_prefix_to="$validation_s3_root" \
   --storage_backend=s3_stream \
   --s3_cache_dir="$s3_cache" \
   --no-s3_cache_images \
@@ -113,4 +118,6 @@ exec "$python" -m accelerate.commands.launch \
   --seed=42 \
   --mixed_precision=bf16 \
   --allow_tf32 \
-  --set_grads_to_none
+  --set_grads_to_none \
+  --resume="$resume_checkpoint" \
+  --validate_on_start
