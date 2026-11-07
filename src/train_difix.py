@@ -63,6 +63,18 @@ ORACLE_THREE_VIEW_PANEL_TITLES = (
     "restored wrapped",
 )
 
+ORACLE_TWO_VIEW_PANEL_TITLES = (
+    "corrupt",
+    "reference",
+    "wrapped reference",
+    "wrapped validity",
+    "wrapped + oracle selection",
+    "oracle-combined render",
+    "clean",
+    "restored render",
+    "restored reference",
+)
+
 
 def _interval_due(step, frequency):
     return frequency > 0 and step % frequency == 0
@@ -124,7 +136,51 @@ def _image_panel(
     original_conditioning=None,
     render_override_mask=None,
 ):
-    if conditioning.shape[1] == 2:
+    if render_override_mask is not None:
+        if original_conditioning is None:
+            raise ValueError(
+                "Oracle panels require original_conditioning"
+            )
+        if original_conditioning.shape[1] != 3:
+            raise ValueError(
+                "Oracle panels require the original wrapped-reference view"
+            )
+        if wrapped_reference_validity is None:
+            raise ValueError(
+                "Oracle panels require wrapped_reference_validity"
+            )
+        if prediction.shape[1] not in (2, 3):
+            raise ValueError(
+                "Oracle panels require two- or three-view predictions"
+            )
+
+        validity_panel = (
+            wrapped_reference_validity[index].repeat(3, 1, 1) * 2.0 - 1.0
+        )
+        selected = render_override_mask[index].bool()
+        red = conditioning.new_tensor([1.0, -1.0, -1.0]).view(3, 1, 1)
+        wrapped = original_conditioning[index, 2]
+        wrapped_overlay = torch.where(
+            selected,
+            wrapped * 0.55 + red * 0.45,
+            wrapped,
+        )
+        panels = [
+            to_uint8_panel(original_conditioning[index, 0]),
+            to_uint8_panel(original_conditioning[index, 1]),
+            to_uint8_panel(wrapped),
+            to_uint8_panel(validity_panel),
+            to_uint8_panel(wrapped_overlay),
+            to_uint8_panel(conditioning[index, 0]),
+            to_uint8_panel(target[index, 0]),
+            to_uint8_panel(prediction[index, 0]),
+            to_uint8_panel(prediction[index, 1]),
+        ]
+        panel_titles = ORACLE_TWO_VIEW_PANEL_TITLES
+        if prediction.shape[1] == 3:
+            panels.append(to_uint8_panel(prediction[index, 2]))
+            panel_titles = ORACLE_THREE_VIEW_PANEL_TITLES
+    elif conditioning.shape[1] == 2:
         panel_titles = TWO_VIEW_PANEL_TITLES
         panels = [
             to_uint8_panel(conditioning[index, 0]),
@@ -141,43 +197,17 @@ def _image_panel(
         validity_panel = (
             wrapped_reference_validity[index].repeat(3, 1, 1) * 2.0 - 1.0
         )
-        if render_override_mask is None:
-            panel_titles = THREE_VIEW_PANEL_TITLES
-            panels = [
-                to_uint8_panel(conditioning[index, 0]),
-                to_uint8_panel(conditioning[index, 1]),
-                to_uint8_panel(conditioning[index, 2]),
-                to_uint8_panel(validity_panel),
-                to_uint8_panel(target[index, 0]),
-                to_uint8_panel(prediction[index, 0]),
-                to_uint8_panel(prediction[index, 1]),
-                to_uint8_panel(prediction[index, 2]),
-            ]
-        else:
-            if original_conditioning is None:
-                raise ValueError(
-                    "Oracle panels require original_conditioning"
-                )
-            selected = render_override_mask[index].bool()
-            red = conditioning.new_tensor([1.0, -1.0, -1.0]).view(3, 1, 1)
-            wrapped_overlay = torch.where(
-                selected,
-                conditioning[index, 2] * 0.55 + red * 0.45,
-                conditioning[index, 2],
-            )
-            panel_titles = ORACLE_THREE_VIEW_PANEL_TITLES
-            panels = [
-                to_uint8_panel(original_conditioning[index, 0]),
-                to_uint8_panel(conditioning[index, 1]),
-                to_uint8_panel(conditioning[index, 2]),
-                to_uint8_panel(validity_panel),
-                to_uint8_panel(wrapped_overlay),
-                to_uint8_panel(conditioning[index, 0]),
-                to_uint8_panel(target[index, 0]),
-                to_uint8_panel(prediction[index, 0]),
-                to_uint8_panel(prediction[index, 1]),
-                to_uint8_panel(prediction[index, 2]),
-            ]
+        panel_titles = THREE_VIEW_PANEL_TITLES
+        panels = [
+            to_uint8_panel(conditioning[index, 0]),
+            to_uint8_panel(conditioning[index, 1]),
+            to_uint8_panel(conditioning[index, 2]),
+            to_uint8_panel(validity_panel),
+            to_uint8_panel(target[index, 0]),
+            to_uint8_panel(prediction[index, 0]),
+            to_uint8_panel(prediction[index, 1]),
+            to_uint8_panel(prediction[index, 2]),
+        ]
     else:
         raise ValueError(
             "DiFix panels support two or three views, got "
@@ -196,6 +226,8 @@ def _image_panel(
 
 def _panel_titles(num_views, oracle_override=False):
     if num_views == 2:
+        if oracle_override:
+            return ORACLE_TWO_VIEW_PANEL_TITLES
         return TWO_VIEW_PANEL_TITLES
     if num_views == 3:
         if oracle_override:
@@ -262,7 +294,7 @@ def _prepare_model_conditioning(
     selected_of_eligible = (
         selected_patch_count / eligible_patch_count.clamp_min(1.0)
     )
-    return model_conditioning, {
+    override_info = {
         "selected_patches": selected_patches,
         "eligible_patches": eligible_patches,
         "copy_mask": (
@@ -275,6 +307,9 @@ def _prepare_model_conditioning(
         "eligible_fraction": eligible_fraction,
         "selected_of_eligible": selected_of_eligible,
     }
+    if not getattr(args, "wrapped_reference_model_view", True):
+        model_conditioning = model_conditioning[:, :2]
+    return model_conditioning, override_info
 
 
 def _log_image(tracker, tag, image, step):
@@ -986,6 +1021,22 @@ def main(args):
         raise ValueError(
             "--sparse_mv_attention requires --wrapped_reference_cache_dir"
         )
+    if not args.wrapped_reference_model_view:
+        if not wrapped_mode:
+            raise ValueError(
+                "--no-wrapped_reference_model_view requires wrapped-reference "
+                "data for endpoint construction"
+            )
+        if args.render_endpoint_mode != "wrapped_patch_override":
+            raise ValueError(
+                "--no-wrapped_reference_model_view is only meaningful with "
+                "--render_endpoint_mode=wrapped_patch_override"
+            )
+        if args.sparse_mv_attention:
+            raise ValueError(
+                "--no-wrapped_reference_model_view cannot be combined with "
+                "--sparse_mv_attention"
+            )
     if (
         args.wrapped_reference_builder_repo is None
     ) != (
@@ -1121,6 +1172,7 @@ def main(args):
 
     if args.gradient_checkpointing:
         net_difix.unet.enable_gradient_checkpointing()
+        net_difix.vae.enable_gradient_checkpointing()
 
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -1348,6 +1400,7 @@ def main(args):
                     wrapped_reference_validity,
                     args,
                 )
+                model_target = target[:, : conditioning.shape[1]]
 
                 with accelerator.autocast():
                     prediction = net_difix(
@@ -1364,7 +1417,7 @@ def main(args):
                         loss_row_weights,
                     ) = _wrapped_loss_tensors(
                         prediction,
-                        target,
+                        model_target,
                         wrapped_reference_validity,
                         args.wrapped_reference_loss_mask,
                     )
@@ -1725,6 +1778,16 @@ def parse_args():
         help=(
             "Scope of wrapped-view supervision. Attention validity remains "
             "independently controlled by the patch-fraction threshold."
+        ),
+    )
+    parser.add_argument(
+        "--wrapped_reference_model_view",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Expose the wrapped reference as a third DiFix model view. "
+            "Disable to use wrapping only for render endpoint replacement "
+            "while retaining the official two-view render/reference model."
         ),
     )
     parser.add_argument("--prompt", default=None)

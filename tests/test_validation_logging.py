@@ -240,6 +240,51 @@ class ValidationLoggingTest(unittest.TestCase):
         self.assertEqual(panel.ndim, 3)
         self.assertEqual(panel.shape[-1], 3)
 
+    def test_oracle_can_condition_official_two_view_model(self):
+        conditioning = torch.zeros(1, 3, 3, 2, 4)
+        conditioning[:, 1] = 0.25
+        conditioning[:, 2, :, :, :2] = 0.75
+        target = torch.ones_like(conditioning)
+        target[:, 1] = conditioning[:, 1]
+        validity = torch.ones(1, 1, 2, 4)
+        args = SimpleNamespace(
+            render_endpoint_mode="wrapped_patch_override",
+            render_endpoint_override_patch_size=2,
+            render_endpoint_override_valid_fraction=1.0,
+            wrapped_reference_model_view=False,
+            render_endpoint_override_policy="oracle_gt",
+            render_endpoint_oracle_metric="l1",
+            render_endpoint_oracle_window_patches=3,
+            render_endpoint_oracle_margin=0.0,
+            render_endpoint_oracle_relative_gain=0.0,
+            render_endpoint_oracle_lpips_chunk_size=16,
+        )
+
+        model_conditioning, info = _prepare_model_conditioning(
+            conditioning,
+            target,
+            validity,
+            args,
+        )
+
+        self.assertEqual(tuple(model_conditioning.shape), (1, 2, 3, 2, 4))
+        self.assertTrue(
+            torch.all(model_conditioning[:, 0, :, :, :2] == 0.75)
+        )
+        prediction = target[:, :2].clone()
+        panel = _image_panel(
+            model_conditioning,
+            target,
+            prediction,
+            0,
+            "pair-0",
+            validity,
+            original_conditioning=conditioning,
+            render_override_mask=info["selected_patches"],
+        )
+        self.assertEqual(panel.ndim, 3)
+        self.assertEqual(panel.shape[-1], 3)
+
     def test_valid_wrapped_metrics_ignore_unsupervised_holes(self):
         prediction = torch.ones(1, 3, 4, 4)
         target = torch.zeros_like(prediction)
