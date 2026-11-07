@@ -47,7 +47,10 @@ def parse_args():
 def iter_split_records(input_path, split, backend):
     if backend == "streaming":
         with input_path.open("rb") as source:
-            yield from ijson.kvitems(source, split)
+            # Camera calibration fields must remain regular JSON numbers.
+            # ijson otherwise emits Decimal instances, which json.dumps
+            # cannot serialize when geometry is retained in compact records.
+            yield from ijson.kvitems(source, split, use_float=True)
         return
 
     try:
