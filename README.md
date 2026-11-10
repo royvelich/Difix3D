@@ -113,6 +113,33 @@ training and DataLoader processes can share it without each parsing the full
 JSON manifest. Pass `difix_train.jsonl` as `--dataset_path`; regular JSON
 manifests remain supported for smaller validation sets.
 
+By default, the optimizer includes every trainable parameter exactly once.
+Pass `--legacy_difix_optimizer` only when reproducing the public DiFix
+trainer's historical parameter-list behavior. That mode intentionally includes
+the LoRA parameters inside the four VAE decoder skip convolutions twice, and
+prints both the total and unique parameter counts at startup.
+
+Set `--lambda_gram=0` to disable Gram loss. In that mode the standalone
+torchvision VGG16 used by Gram loss is not loaded; LPIPS still loads and uses
+its own internal VGG feature network.
+
+Render conditioning can be smoothed before it enters the SD-Turbo VAE:
+
+```bash
+--render_endpoint_mode=original \
+--render_endpoint_smoothing_mode=gaussian \
+--render_endpoint_smoothing_kernel_size=11 \
+--render_endpoint_smoothing_sigma=5 \
+--render_endpoint_smoothing_strength=1
+```
+
+For `--render_endpoint_mode=wrapped_patch_override`,
+`--render_endpoint_smoothing_placement=before_combination` smooths the render
+before selecting and copying wrapped patches, while `after_combination`
+smooths the completed wrapped/render composite. Validation and training panels
+use the same preprocessing path and show both the original corrupt render and
+the processed model input.
+
 #### Single GPU
 
 ```bash

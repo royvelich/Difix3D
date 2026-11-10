@@ -17,6 +17,7 @@ from train_difix import (  # noqa: E402
     _image_panel,
     _log_image,
     _log_metric_scalars,
+    _panel_titles,
     _prepare_model_conditioning,
     _valid_pixel_metrics,
     _wrapped_loss_tensors,
@@ -284,6 +285,118 @@ class ValidationLoggingTest(unittest.TestCase):
         )
         self.assertEqual(panel.ndim, 3)
         self.assertEqual(panel.shape[-1], 3)
+
+    def test_original_render_smoothing_is_shared_by_train_and_validation(self):
+        conditioning = torch.zeros(1, 2, 3, 7, 7)
+        conditioning[:, 0, :, 3, 3] = 1.0
+        conditioning[:, 1] = 0.25
+        target = torch.zeros_like(conditioning)
+        args = SimpleNamespace(
+            render_endpoint_mode="original",
+            render_endpoint_smoothing_mode="gaussian",
+            render_endpoint_smoothing_placement="after_combination",
+            render_endpoint_smoothing_kernel_size=3,
+            render_endpoint_smoothing_sigma=1.0,
+            render_endpoint_smoothing_strength=1.0,
+        )
+
+        model_conditioning, info = _prepare_model_conditioning(
+            conditioning,
+            target,
+            None,
+            args,
+        )
+
+        self.assertIsNone(info)
+        self.assertIsNot(model_conditioning, conditioning)
+        self.assertLess(
+            float(model_conditioning[:, 0, :, 3, 3].max()),
+            1.0,
+        )
+        self.assertGreater(
+            float(model_conditioning[:, 0, :, 3, 2].min()),
+            0.0,
+        )
+        torch.testing.assert_close(
+            model_conditioning[:, 1],
+            conditioning[:, 1],
+        )
+        torch.testing.assert_close(
+            conditioning[:, 0, :, 3, 3],
+            torch.ones(1, 3),
+        )
+
+        panel = _image_panel(
+            model_conditioning,
+            target,
+            target,
+            0,
+            "pair-0",
+            original_conditioning=conditioning,
+            render_smoothing_applied=True,
+        )
+        self.assertEqual(panel.ndim, 3)
+        self.assertEqual(panel.shape[-1], 3)
+        self.assertEqual(
+            _panel_titles(2, render_smoothing=True),
+            (
+                "corrupt",
+                "smoothed render",
+                "reference",
+                "clean",
+                "restored render",
+                "restored reference",
+            ),
+        )
+
+    def test_smoothing_placement_controls_wrapped_patch_boundaries(self):
+        conditioning = torch.zeros(1, 3, 3, 6, 6)
+        conditioning[:, 2, :, :, :3] = 1.0
+        target = torch.zeros_like(conditioning)
+        validity = torch.zeros(1, 1, 6, 6)
+        validity[..., :3] = 1.0
+        common = dict(
+            render_endpoint_mode="wrapped_patch_override",
+            render_endpoint_override_patch_size=3,
+            render_endpoint_override_valid_fraction=1.0,
+            wrapped_reference_model_view=False,
+            render_endpoint_override_policy="all_valid",
+            render_endpoint_oracle_metric="l1",
+            render_endpoint_oracle_window_patches=3,
+            render_endpoint_oracle_margin=0.0,
+            render_endpoint_oracle_relative_gain=0.0,
+            render_endpoint_oracle_lpips_chunk_size=16,
+            render_endpoint_smoothing_mode="gaussian",
+            render_endpoint_smoothing_kernel_size=3,
+            render_endpoint_smoothing_sigma=1.0,
+            render_endpoint_smoothing_strength=1.0,
+        )
+
+        before, _ = _prepare_model_conditioning(
+            conditioning,
+            target,
+            validity,
+            SimpleNamespace(
+                **common,
+                render_endpoint_smoothing_placement="before_combination",
+            ),
+        )
+        after, _ = _prepare_model_conditioning(
+            conditioning,
+            target,
+            validity,
+            SimpleNamespace(
+                **common,
+                render_endpoint_smoothing_placement="after_combination",
+            ),
+        )
+
+        torch.testing.assert_close(
+            before[:, 0, :, :, :3],
+            torch.ones_like(before[:, 0, :, :, :3]),
+        )
+        self.assertLess(float(after[:, 0, :, :, 2].max()), 1.0)
+        self.assertGreater(float(after[:, 0, :, :, 3].min()), 0.0)
 
     def test_valid_wrapped_metrics_ignore_unsupervised_holes(self):
         prediction = torch.ones(1, 3, 4, 4)

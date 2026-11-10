@@ -27,6 +27,7 @@ from dataset import PairedDataset
 from loss import gram_loss
 from metrics import batch_metrics, iqa_backend_metadata
 from model import Difix, load_ckpt_from_state_dict, save_ckpt
+from render_preprocessing import smooth_render_endpoint
 from visualization import build_labeled_grid, save_grid, to_uint8_panel
 from wrapped_patch_oracle import override_render_with_wrapped_patches
 
@@ -39,8 +40,29 @@ TWO_VIEW_PANEL_TITLES = (
     "restored reference",
 )
 
+SMOOTHED_TWO_VIEW_PANEL_TITLES = (
+    "corrupt",
+    "smoothed render",
+    "reference",
+    "clean",
+    "restored render",
+    "restored reference",
+)
+
 THREE_VIEW_PANEL_TITLES = (
     "corrupt",
+    "reference",
+    "wrapped reference",
+    "wrapped validity",
+    "clean",
+    "restored render",
+    "restored reference",
+    "restored wrapped",
+)
+
+SMOOTHED_THREE_VIEW_PANEL_TITLES = (
+    "corrupt",
+    "smoothed render",
     "reference",
     "wrapped reference",
     "wrapped validity",
@@ -96,6 +118,53 @@ def _find_resume_checkpoint(resume):
     raise ValueError(f"Invalid resume checkpoint or directory: {resume}")
 
 
+def _optimizer_parameters(net_difix, legacy_difix_optimizer=False):
+    """Build the optimizer parameter list.
+
+    The public DiFix trainer first adds every VAE LoRA parameter, then adds
+    every parameter from the four decoder skip convolutions. Because the skip
+    convolutions are themselves LoRA-wrapped, their LoRA parameters occur
+    twice in that list. Preserve that historical behavior only when explicitly
+    requested; otherwise optimize every trainable parameter exactly once.
+    """
+
+    if not legacy_difix_optimizer:
+        return [
+            parameter
+            for parameter in net_difix.parameters()
+            if parameter.requires_grad
+        ]
+
+    parameters = list(net_difix.unet.parameters())
+    for name, parameter in net_difix.vae.named_parameters():
+        if "lora" in name and "vae_skip" in name:
+            if not parameter.requires_grad:
+                raise RuntimeError(
+                    f"Legacy DiFix optimizer expected trainable parameter {name}"
+                )
+            parameters.append(parameter)
+
+    for index in range(1, 5):
+        skip_conv = getattr(net_difix.vae.decoder, f"skip_conv_{index}")
+        parameters.extend(skip_conv.parameters())
+
+    return parameters
+
+
+def _build_gram_feature_network(lambda_gram):
+    """Create the standalone Gram-loss VGG only when it is enabled."""
+
+    if lambda_gram < 0:
+        raise ValueError("lambda_gram must be non-negative")
+    if lambda_gram == 0:
+        return None
+
+    network = torchvision.models.vgg16(pretrained=True).features
+    network.requires_grad_(False)
+    network.eval()
+    return network
+
+
 class _StridedValidationSampler(torch.utils.data.Sampler):
     """Partition validation indices across ranks without padding duplicates."""
 
@@ -135,6 +204,7 @@ def _image_panel(
     wrapped_reference_validity=None,
     original_conditioning=None,
     render_override_mask=None,
+    render_smoothing_applied=False,
 ):
     if render_override_mask is not None:
         if original_conditioning is None:
@@ -180,6 +250,48 @@ def _image_panel(
         if prediction.shape[1] == 3:
             panels.append(to_uint8_panel(prediction[index, 2]))
             panel_titles = ORACLE_THREE_VIEW_PANEL_TITLES
+    elif render_smoothing_applied:
+        if original_conditioning is None:
+            raise ValueError(
+                "Smoothed-render panels require original_conditioning"
+            )
+        if conditioning.shape[1] == 2:
+            panel_titles = SMOOTHED_TWO_VIEW_PANEL_TITLES
+            panels = [
+                to_uint8_panel(original_conditioning[index, 0]),
+                to_uint8_panel(conditioning[index, 0]),
+                to_uint8_panel(conditioning[index, 1]),
+                to_uint8_panel(target[index, 0]),
+                to_uint8_panel(prediction[index, 0]),
+                to_uint8_panel(prediction[index, 1]),
+            ]
+        elif conditioning.shape[1] == 3:
+            if wrapped_reference_validity is None:
+                raise ValueError(
+                    "Three-view panels require wrapped_reference_validity"
+                )
+            validity_panel = (
+                wrapped_reference_validity[index].repeat(3, 1, 1)
+                * 2.0
+                - 1.0
+            )
+            panel_titles = SMOOTHED_THREE_VIEW_PANEL_TITLES
+            panels = [
+                to_uint8_panel(original_conditioning[index, 0]),
+                to_uint8_panel(conditioning[index, 0]),
+                to_uint8_panel(conditioning[index, 1]),
+                to_uint8_panel(conditioning[index, 2]),
+                to_uint8_panel(validity_panel),
+                to_uint8_panel(target[index, 0]),
+                to_uint8_panel(prediction[index, 0]),
+                to_uint8_panel(prediction[index, 1]),
+                to_uint8_panel(prediction[index, 2]),
+            ]
+        else:
+            raise ValueError(
+                "DiFix panels support two or three views, got "
+                f"{conditioning.shape[1]}"
+            )
     elif conditioning.shape[1] == 2:
         panel_titles = TWO_VIEW_PANEL_TITLES
         panels = [
@@ -224,16 +336,56 @@ def _image_panel(
     )
 
 
-def _panel_titles(num_views, oracle_override=False):
+def _panel_titles(
+    num_views,
+    oracle_override=False,
+    render_smoothing=False,
+):
     if num_views == 2:
         if oracle_override:
             return ORACLE_TWO_VIEW_PANEL_TITLES
+        if render_smoothing:
+            return SMOOTHED_TWO_VIEW_PANEL_TITLES
         return TWO_VIEW_PANEL_TITLES
     if num_views == 3:
         if oracle_override:
             return ORACLE_THREE_VIEW_PANEL_TITLES
+        if render_smoothing:
+            return SMOOTHED_THREE_VIEW_PANEL_TITLES
         return THREE_VIEW_PANEL_TITLES
     raise ValueError(f"Unsupported DiFix view count {num_views}")
+
+
+def _render_smoothing_enabled(args):
+    return (
+        getattr(args, "render_endpoint_smoothing_mode", "none") != "none"
+        and int(
+            getattr(args, "render_endpoint_smoothing_kernel_size", 5)
+        )
+        > 1
+        and float(
+            getattr(args, "render_endpoint_smoothing_strength", 1.0)
+        )
+        > 0.0
+    )
+
+
+def _smooth_render_for_args(render, args):
+    return smooth_render_endpoint(
+        render,
+        mode=getattr(args, "render_endpoint_smoothing_mode", "none"),
+        kernel_size=getattr(
+            args,
+            "render_endpoint_smoothing_kernel_size",
+            5,
+        ),
+        sigma=getattr(args, "render_endpoint_smoothing_sigma", 1.0),
+        strength=getattr(
+            args,
+            "render_endpoint_smoothing_strength",
+            1.0,
+        ),
+    )
 
 
 def _prepare_model_conditioning(
@@ -242,10 +394,16 @@ def _prepare_model_conditioning(
     wrapped_reference_validity,
     args,
 ):
-    """Build the optional oracle-combined render using shared train/val code."""
+    """Build the processed render conditioning using shared train/val code."""
 
     if args.render_endpoint_mode == "original":
-        return conditioning, None
+        render = conditioning[:, 0]
+        smoothed_render = _smooth_render_for_args(render, args)
+        if smoothed_render is render:
+            return conditioning, None
+        model_conditioning = conditioning.clone()
+        model_conditioning[:, 0] = smoothed_render
+        return model_conditioning, None
     if args.render_endpoint_mode != "wrapped_patch_override":
         raise ValueError(
             "render_endpoint_mode must be original|wrapped_patch_override"
@@ -260,9 +418,18 @@ def _prepare_model_conditioning(
             "wrapped-patch render replacement requires wrapped validity"
         )
 
+    render = conditioning[:, 0]
+    smoothing_placement = getattr(
+        args,
+        "render_endpoint_smoothing_placement",
+        "after_combination",
+    )
+    if smoothing_placement == "before_combination":
+        render = _smooth_render_for_args(render, args)
+
     combined, selected_patches, eligible_patches = (
         override_render_with_wrapped_patches(
-            conditioning[:, 0],
+            render,
             conditioning[:, 2],
             wrapped_reference_validity,
             patch_size=args.render_endpoint_override_patch_size,
@@ -282,6 +449,8 @@ def _prepare_model_conditioning(
             ),
         )
     )
+    if smoothing_placement == "after_combination":
+        combined = _smooth_render_for_args(combined, args)
     model_conditioning = conditioning.clone()
     model_conditioning[:, 0] = combined
 
@@ -779,6 +948,17 @@ def _run_validation(
                 for name, value in input_metrics.items()
             }
         )
+        if _render_smoothing_enabled(args):
+            smoothed_input_metrics = batch_metrics(
+                conditioning[:, 0],
+                target[:, 0],
+            )
+            metrics.update(
+                {
+                    f"smoothed_input_{name}": value
+                    for name, value in smoothed_input_metrics.items()
+                }
+            )
         metrics.update(
             {
                 f"restored_reference_{name}": value
@@ -849,6 +1029,7 @@ def _run_validation(
                     if override_info is not None
                     else None
                 ),
+                render_smoothing_applied=_render_smoothing_enabled(args),
             )
             row_path = save_grid(
                 panel,
@@ -912,6 +1093,7 @@ def _run_validation(
                 "oracle_override_patch_fraction" in row["metrics"]
                 for row in rows
             ),
+            render_smoothing=_render_smoothing_enabled(args),
         )
         summary_path = os.path.join(row_dir, "validation_summary.json")
         with open(summary_path, "w", encoding="utf-8") as handle:
@@ -969,6 +1151,7 @@ def _run_validation(
         summary_bits = []
         for prefix in (
             "input",
+            "smoothed_input",
             "ours_ref",
             "restored_reference",
             "restored_wrapped",
@@ -1123,6 +1306,29 @@ def main(args):
         raise ValueError(
             "--render_endpoint_oracle_lpips_chunk_size must be >= 1"
         )
+    if (
+        args.render_endpoint_smoothing_kernel_size < 1
+        or args.render_endpoint_smoothing_kernel_size % 2 != 1
+    ):
+        raise ValueError(
+            "--render_endpoint_smoothing_kernel_size must be a positive "
+            "odd integer"
+        )
+    if (
+        not math.isfinite(args.render_endpoint_smoothing_sigma)
+        or args.render_endpoint_smoothing_sigma <= 0.0
+    ):
+        raise ValueError(
+            "--render_endpoint_smoothing_sigma must be finite and > 0"
+        )
+    if not (
+        math.isfinite(args.render_endpoint_smoothing_strength)
+        and 0.0 <= args.render_endpoint_smoothing_strength <= 1.0
+    ):
+        raise ValueError(
+            "--render_endpoint_smoothing_strength must be finite and "
+            "in [0, 1]"
+        )
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -1250,15 +1456,37 @@ def main(args):
     net_lpips.requires_grad_(False)
     net_lpips.eval()
 
-    net_vgg = torchvision.models.vgg16(pretrained=True).features
-    net_vgg.requires_grad_(False)
-    net_vgg.eval()
+    net_vgg = _build_gram_feature_network(args.lambda_gram)
 
-    layers_to_optimize = [
-        parameter for parameter in net_difix.parameters() if parameter.requires_grad
-    ]
+    layers_to_optimize = _optimizer_parameters(
+        net_difix,
+        legacy_difix_optimizer=args.legacy_difix_optimizer,
+    )
     if not layers_to_optimize:
         raise RuntimeError("The model has no trainable parameters")
+    unique_optimizer_parameters = len(
+        {id(parameter) for parameter in layers_to_optimize}
+    )
+    duplicate_optimizer_references = (
+        len(layers_to_optimize) - unique_optimizer_parameters
+    )
+    if args.legacy_difix_optimizer and duplicate_optimizer_references == 0:
+        raise RuntimeError(
+            "Legacy DiFix optimizer mode did not reproduce any duplicated "
+            "skip-convolution LoRA parameter references"
+        )
+    if accelerator.is_main_process:
+        optimizer_mode = (
+            "legacy_difix"
+            if args.legacy_difix_optimizer
+            else "deduplicated"
+        )
+        print(
+            f"optimizer mode={optimizer_mode}, "
+            f"parameter references={len(layers_to_optimize)}, "
+            f"unique parameters={unique_optimizer_parameters}, "
+            f"duplicate references={duplicate_optimizer_references}"
+        )
 
     optimizer = torch.optim.AdamW(
         layers_to_optimize,
@@ -1304,7 +1532,7 @@ def main(args):
     net_lpips.to(accelerator.device)
     net_vgg_on_device = False
     if (
-        args.lambda_gram > 0
+        net_vgg is not None
         and global_step > args.gram_loss_warmup_steps
     ):
         net_vgg.to(accelerator.device)
@@ -1443,6 +1671,11 @@ def main(args):
                         args.lambda_gram > 0
                         and global_step > args.gram_loss_warmup_steps
                     ):
+                        if net_vgg is None:
+                            raise RuntimeError(
+                                "Gram loss is enabled but its VGG network "
+                                "was not initialized"
+                            )
                         if not net_vgg_on_device:
                             net_vgg.to(conditioning.device)
                             net_vgg_on_device = True
@@ -1548,6 +1781,9 @@ def main(args):
                             override_info["copy_mask"]
                             if override_info is not None
                             else None
+                        ),
+                        render_smoothing_applied=(
+                            _render_smoothing_enabled(args)
                         ),
                     )
                     for index in range(batch_size)
@@ -1922,6 +2158,46 @@ def parse_args():
         default=64,
         type=int,
     )
+    parser.add_argument(
+        "--render_endpoint_smoothing_mode",
+        default="none",
+        choices=["none", "gaussian", "box"],
+        help=(
+            "Optional low-pass filter applied to the corrupt render before "
+            "the SD-Turbo VAE."
+        ),
+    )
+    parser.add_argument(
+        "--render_endpoint_smoothing_placement",
+        default="after_combination",
+        choices=["before_combination", "after_combination"],
+        help=(
+            "For wrapped-patch endpoints, smooth the render before patch "
+            "composition or smooth the completed composite afterward. "
+            "For original endpoints both choices smooth the render directly."
+        ),
+    )
+    parser.add_argument(
+        "--render_endpoint_smoothing_kernel_size",
+        default=5,
+        type=int,
+        help="Positive odd pixel-space smoothing-kernel size.",
+    )
+    parser.add_argument(
+        "--render_endpoint_smoothing_sigma",
+        default=1.0,
+        type=float,
+        help="Gaussian standard deviation in input-image pixels.",
+    )
+    parser.add_argument(
+        "--render_endpoint_smoothing_strength",
+        default=1.0,
+        type=float,
+        help=(
+            "Blend from the original render (0) to the fully smoothed "
+            "render (1)."
+        ),
+    )
 
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--seed", default=42, type=int)
@@ -1952,6 +2228,17 @@ def parse_args():
     parser.add_argument("--adam_weight_decay", default=1e-2, type=float)
     parser.add_argument("--adam_epsilon", default=1e-8, type=float)
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
+    parser.add_argument(
+        "--legacy_difix_optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reproduce the public DiFix optimizer parameter list, including "
+            "duplicate references to LoRA parameters inside VAE decoder skip "
+            "convolutions. The default optimizes every trainable parameter "
+            "exactly once."
+        ),
+    )
     parser.add_argument("--allow_tf32", action="store_true")
     parser.add_argument(
         "--report_to",
